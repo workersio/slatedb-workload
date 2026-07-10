@@ -24,7 +24,7 @@ explorations:
     replay: {run: "01KX5Y6CBAG0JDG3GA8CQ38KKD", case: baseline, seed: 3}
     freshness: new-current
     reported: null
-    published: null
+    published: nd773r0vv83vyqgz37gawwy7s98a889n
   - key: durable-ack-crash-mid-flush
     title: SIGKILL mid-flush, acked writes survive
     description: >-
