@@ -56,11 +56,14 @@ LIVENESS_DEADLINE_S = float(os.environ.get("SLATEDB_LIVENESS_S", "120"))
 # at ~100ms/op with NO pacing flag needed; a large --ops naturally spans many
 # seconds and the SIGKILL always lands mid-run (we kill well before completion).
 CRASH_OPS = int(os.environ.get("SLATEDB_CRASH_OPS", "2000"))
-# The seed-swept kill lands T ms after the run starts, T log-uniform over
-# [floor, window] (crashclock LatencyWindowSpace) — different seeds kill at
-# different flush offsets. window kept < CRASH_OPS*~100ms so run never finishes.
-CRASH_WINDOW_MS = float(os.environ.get("SLATEDB_CRASH_WINDOW_MS", "6000"))
-CRASH_FLOOR_MS = float(os.environ.get("SLATEDB_CRASH_FLOOR_MS", "300"))
+# Kill trigger is ACK-PROGRESS, not wall-clock. The deterministic sim runs ~10x+
+# slower per-op than the box (measured in-guest: 0 acks by 1.7s vs ~20 on the
+# box), so a fixed ms window fires before any ack lands → VOID. Instead SIGKILL
+# right after the seed-derived K-th fsync'd ack: deterministic w.r.t. the SUT's
+# real flush progress, identical on box and guest, and still mid-flush (the K-th
+# ack just resolved while the next put/flush is in flight). K ∈ [2, MAX].
+CRASH_KILL_MAX_ACKS = int(os.environ.get("SLATEDB_CRASH_KILL_MAX_ACKS", "12"))
+CRASH_KILL_DEADLINE_S = float(os.environ.get("SLATEDB_CRASH_KILL_DEADLINE_S", "180"))
 
 
 def emit(msg: str) -> None:
@@ -149,6 +152,22 @@ def read_acked(ack_log: str):
             if len(parts) == 3:
                 out.append((parts[0], parts[1], parts[2]))
     return out
+
+
+def count_acked(ack_log: str) -> int:
+    """Cheap fsync'd-ack progress counter for the kill trigger (line count)."""
+    try:
+        with open(ack_log) as f:
+            return sum(1 for line in f if line.strip())
+    except FileNotFoundError:
+        return 0
+
+
+def kill_after_acks(seed: int) -> int:
+    """Seed-derived K ∈ [2, CRASH_KILL_MAX_ACKS] — replayable, spans flush depths."""
+    import hashlib
+    h = int.from_bytes(hashlib.sha256(f"{seed}:crash_mid_flush_ackidx".encode()).digest()[:4], "big")
+    return 2 + (h % (CRASH_KILL_MAX_ACKS - 1))
 
 
 # ---------------------------------------------------------------------------
@@ -313,19 +332,13 @@ def case_crash_mid_flush(seed: int) -> int:
     os.close(ack_fd)
     os.unlink(ack_log)  # let the driver create it fresh (append semantics)
 
-    # --- declared fault timing: derive the SIGKILL point from the seed --------
-    # LatencyWindowSpace: kill T ms after the run starts, T log-uniform over the
-    # flush arm so seeds straddle flush boundaries. Same seed => same T (replayable).
-    space = crashclock.latency_window(
-        "crash_mid_flush", window_ms=CRASH_WINDOW_MS, floor_ms=CRASH_FLOOR_MS
-    )
-    point = crashclock.offsets(seed, space)
-    kill_at_s = float(point["T_ms"]) / 1000.0
+    # --- declared fault timing: SIGKILL after the seed-derived K-th ack -------
+    # ACK-PROGRESS trigger (portable across box/guest — see CRASH_KILL_* notes).
+    kill_k = kill_after_acks(seed)
 
     emit(f"CASE crash-mid-flush seed={seed} ops={CRASH_OPS} root={root} ack_log={ack_log}")
-    crashclock.clock_armed("crash-mid-flush", point)  # emits the CLOCK triage line
-    emit(f"KILL armed offset T_ms={point['T_ms']:.3f} (kill_at={kill_at_s:.3f}s) "
-         f"window_ms={CRASH_WINDOW_MS:g} seed={seed}")
+    emit(f"CLOCK crash-mid-flush armed kind=ack_progress axis=crash_mid_flush "
+         f"kill_after_acks={kill_k} max_acks={CRASH_KILL_MAX_ACKS} seed={seed}")
 
     # --- spawn the acked put stream in its own process group ------------------
     # start_new_session=True → child is the pgid leader; we SIGKILL the whole group
@@ -339,9 +352,17 @@ def case_crash_mid_flush(seed: int) -> int:
         start_new_session=True,
     )
     t_start = time.time()
-    remaining = kill_at_s - (time.time() - t_start)
-    if remaining > 0:
-        time.sleep(remaining)
+    deadline = t_start + CRASH_KILL_DEADLINE_S
+    # poll fsync'd-ack progress; kill the pg once K acks landed (or the proc exits,
+    # or a hard wall deadline as a liveness backstop).
+    while True:
+        if count_acked(ack_log) >= kill_k:
+            break
+        if proc.poll() is not None:
+            break  # run ended before reaching K acks — VOID handled below
+        if time.time() > deadline:
+            break  # liveness backstop: kill whatever progress exists
+        time.sleep(0.03)
 
     kill_mode = "already_dead"
     if proc.poll() is None:
@@ -351,26 +372,23 @@ def case_crash_mid_flush(seed: int) -> int:
     killed_rc = proc.returncode
     kill_wall = time.time() - t_start
 
-    # A T_ms=0 (zero-corner) kill can fire before the driver even creates the
-    # ack-log — that is the "too early" VOID case, not a crash of this harness.
     acked = read_acked(ack_log) if os.path.exists(ack_log) else []
     n_pre = len(acked)
     emit(f"KILLED mode={kill_mode} rc={killed_rc} acked_before_kill={n_pre} "
-         f"kill_wall={kill_wall:.3f}s ops={CRASH_OPS}")
+         f"kill_after={kill_k} kill_wall={kill_wall:.3f}s ops={CRASH_OPS}")
 
     # --- anti-vacuity floors: the kill must land MID-RUN with acks recorded ---
-    # rc==0 means the run streamed all CRASH_OPS and exited cleanly before the
-    # kill fired — the SIGKILL never landed mid-flush, so a green would be theater.
+    # rc==0 means the run streamed all CRASH_OPS and exited cleanly before we could
+    # kill — the SIGKILL never landed mid-flush, so a green would be theater.
     if killed_rc == 0:
         disarm_liveness(True, "kill missed window (run completed)")
-        emit(f"VERDICT: VOID — SIGKILL landed after run completed (all {CRASH_OPS} "
-             f"ops acked); raise SLATEDB_CRASH_OPS or shrink window. "
-             f"seed={seed} T_ms={point['T_ms']:.3f}")
+        emit(f"VERDICT: VOID — run completed all {CRASH_OPS} ops before the K-th ack "
+             f"kill; raise SLATEDB_CRASH_OPS. seed={seed} kill_after={kill_k}")
         return 3
     if n_pre < 1:
         disarm_liveness(True, "kill too early — no acked writes")
-        emit(f"VERDICT: VOID — no acked writes before the kill (fired too early); "
-             f"seed={seed} T_ms={point['T_ms']:.3f}")
+        emit(f"VERDICT: VOID — no acked writes before the kill (driver stalled or "
+             f"deadline hit before first ack); seed={seed} kill_after={kill_k}")
         return 3
 
     # --- ORACLE_SELFTEST: plant a fake acked key the DB never wrote -----------
@@ -407,13 +425,13 @@ def case_crash_mid_flush(seed: int) -> int:
     # --- durable_ack_subset: the bespoke A ⊆ R verdict ------------------------
     subset_pass = terminal_ok and subset_ok and lost == 0 and mismatch == 0
     summary = (f"checked={checked} lost={lost} mismatch={mismatch} "
-               f"bad={sorted(bad_keys)[:8]} seed={seed} kill_T_ms={point['T_ms']:.3f}")
+               f"bad={sorted(bad_keys)[:8]} seed={seed} kill_after={kill_k}")
     invariant("durable_ack_subset", "acked-subset-readable", subset_pass, summary)
 
     if not subset_pass:
         disarm_liveness(True, "verdict reached (durable_ack_subset FAIL)")
         emit(f"VERDICT: RED — acked writes not durable after SIGKILL+reopen: {summary}")
-        emit(f"REPLAY red: SEED={seed} case=crash-mid-flush kill_T_ms={point['T_ms']:.3f} "
+        emit(f"REPLAY red: SEED={seed} case=crash-mid-flush kill_after={kill_k} "
              f"acked_before_kill={n_pre}")
         return 1
 
