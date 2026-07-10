@@ -394,11 +394,192 @@ async fn cmd_durprobe(args: &[String]) {
     );
 }
 
+// ---------------------------------------------------------------------------
+// remote-run — the crash-confirm producer.
+//
+// Combines `run`'s crash-safe fsync'd side-log with `durprobe`'s Remote reads.
+// Opens the Db with DEFAULT settings (flush_interval=Some(100ms) — config.rs:978)
+// so this is a realistic mix: most writes are await_durable=false (in-memory,
+// not yet durable) and a minority await_durable=true (forces flush progress), and
+// the 100ms auto-flush steadily promotes older writes to Remote-durable.
+//
+// Each op writes a fresh unique key (k{seq}), then sweeps the not-yet-logged keys
+// oldest-first with a `get_with_options(.., Remote)` read. Remote visibility is a
+// per-seq watermark (last_remote_persisted_seq — reader.rs:111-113), so the
+// not-yet-durable keys are always a contiguous suffix: we advance a cursor and
+// stop at the first Remote miss. Whenever Remote returns Some(value) value-exact,
+// we append+fsync `(seq,key,value)` to a remote-observed log kept OUTSIDE the db
+// root — the SAME crash-safety rule as the ack-log: per-observation fsync, so a
+// SIGKILL mid-stream leaves a trustworthy fsync'd R_remote prefix. ONLY values
+// Remote actually returned are logged.
+//
+// There is no clean exit on the crash path; the caller SIGKILLs mid-stream.
+// ---------------------------------------------------------------------------
+
+async fn cmd_remote_run(args: &[String]) {
+    let root = require(args, "--root");
+    let remote_log = require(args, "--remote-log");
+    let seed: u64 = require(args, "--seed").parse().expect("--seed u64");
+    let ops: u64 = require(args, "--ops").parse().expect("--ops u64");
+    // Every DURABLE_EVERY-th op (seq>0) is await_durable=true — a minority of the
+    // stream, present only to force flush progress. All other ops are
+    // await_durable=false so Memory and Remote genuinely diverge.
+    let durable_every: u64 = flag(args, "--durable-every")
+        .map(|s| s.parse().expect("--durable-every u64"))
+        .unwrap_or(8);
+
+    // Remote-observed log lives OUTSIDE the db root (the caller passes an absolute
+    // path); append so a re-run appends rather than truncating history.
+    let mut log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&remote_log)
+        .unwrap_or_else(|e| panic!("open remote-log {remote_log}: {e}"));
+
+    // DEFAULT settings (flush_interval=Some(100ms)) — NOT flush_interval=None. We
+    // WANT a realistic durable/not-yet-durable mix here, not the hard divergence.
+    let db = open_db(&root, None).await;
+
+    let put_opts = PutOptions::default();
+    let write_dirty = WriteOptions {
+        await_durable: false,
+        ..Default::default()
+    };
+    let write_durable = WriteOptions {
+        await_durable: true,
+        ..Default::default()
+    };
+    let read_remote = ReadOptions {
+        durability_filter: DurabilityLevel::Remote,
+        ..Default::default()
+    };
+
+    let mut rng = XorShift64::new(seed);
+    // Every (key,value) written so far, in seq order (keys unique → no overwrite).
+    let mut kvs: Vec<(String, String)> = Vec::new();
+    // Cursor: index of the oldest key not yet Remote-observed+logged. Remote
+    // visibility is monotone in seq, so [cursor..] is exactly the not-yet-durable
+    // suffix; we never need to re-check a logged key.
+    let mut cursor: usize = 0;
+
+    for seq in 0..ops {
+        let (key, value) = op_kv(&mut rng, seq);
+        let durable = durable_every > 0 && seq > 0 && seq % durable_every == 0;
+        let wo = if durable { &write_durable } else { &write_dirty };
+        db.put_with_options(key.as_bytes(), value.as_bytes(), &put_opts, wo)
+            .await
+            .unwrap_or_else(|e| panic!("put seq={seq}: {e}"));
+        kvs.push((key, value));
+
+        // Sweep the not-yet-logged suffix oldest-first; log every value Remote now
+        // returns, and STOP at the first Remote miss (nothing after it is durable
+        // yet either — the Remote watermark is monotone in seq).
+        while cursor < kvs.len() {
+            let (k, v) = &kvs[cursor];
+            let got = db
+                .get_with_options(k.as_bytes(), &read_remote)
+                .await
+                .unwrap_or_else(|e| panic!("get(remote) {k}: {e}"));
+            match got {
+                Some(b) if b.as_ref() == v.as_bytes() => {
+                    // Remote surfaced this value → the SUT is asserting it is
+                    // durable in object storage → a crash MUST NOT lose it.
+                    // Append+fsync BEFORE advancing (crash-safe prefix).
+                    writeln!(log, "{seq}\t{k}\t{v}").expect("write remote-log");
+                    log.flush().expect("flush remote-log");
+                    log.sync_all().expect("fsync remote-log");
+                    cursor += 1;
+                }
+                // A value-mismatch under Remote (impossible with unique keys) or a
+                // miss: stop the sweep — the suffix is not yet durable.
+                _ => break,
+            }
+        }
+    }
+
+    // Clean exit only on the (rare) non-crash path — durability must not rely on it.
+    db.close().await.expect("db.close");
+    println!("REMOTE_RUN done ops={ops} remote_log={remote_log}");
+}
+
+// ---------------------------------------------------------------------------
+// verify-remote — reopen the (SIGKILLed) root and assert R_remote ⊆ survivors.
+//
+// Every (key,value) the remote-observed log recorded MUST be present value-exact
+// in the recovered DB. A logged Remote value that is now missing/stale = the SUT
+// surfaced non-durable data through Remote = wrong-durable-read. Prints LOST/
+// MISMATCH per bad key and a machine-readable VERIFY_REMOTE line. Always exits 0
+// — the python oracle plane owns the verdict.
+// ---------------------------------------------------------------------------
+
+async fn cmd_verify_remote(args: &[String]) {
+    let root = require(args, "--root");
+    let remote_log = require(args, "--remote-log");
+
+    let db = match open_db_result(&root, None).await {
+        Ok(db) => db,
+        Err(e) => {
+            println!("VERIFY_REMOTE_OPEN_FAILED err={e:?}");
+            return;
+        }
+    };
+
+    let f = File::open(&remote_log)
+        .unwrap_or_else(|e| panic!("open remote-log {remote_log}: {e}"));
+    let reader = BufReader::new(f);
+
+    let mut checked: u64 = 0;
+    let mut lost: u64 = 0;
+    let mut mismatch: u64 = 0;
+
+    for line in reader.lines() {
+        let line = line.expect("read remote-log line");
+        let line = line.trim_end_matches('\n');
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(3, '\t');
+        let _seq = parts.next().unwrap_or("");
+        let key = match parts.next() {
+            Some(k) => k,
+            None => continue,
+        };
+        let value = parts.next().unwrap_or("");
+        checked += 1;
+
+        // Default (Memory) read on the reopened DB reads the recovered/durable
+        // state — exactly the "surviving state" the invariant is about.
+        match db.get(key.as_bytes()).await.expect("db.get") {
+            None => {
+                lost += 1;
+                println!("LOST {key}");
+            }
+            Some(got) => {
+                if got != Bytes::from(value.as_bytes().to_vec()) {
+                    mismatch += 1;
+                    println!("MISMATCH {key}");
+                }
+            }
+        }
+    }
+
+    db.close().await.expect("db.close");
+
+    let subset_ok = lost == 0 && mismatch == 0;
+    if subset_ok {
+        println!("OK {checked}");
+    }
+    println!(
+        "VERIFY_REMOTE subset_ok={subset_ok} checked={checked} lost={lost} mismatch={mismatch}"
+    );
+    // Always exit 0 — the python oracle plane owns the verdict.
+}
+
 #[tokio::main]
 async fn main() {
     let argv: Vec<String> = std::env::args().collect();
     if argv.len() < 2 {
-        eprintln!("usage: slatedb-driver <run|verify|durprobe> [flags]");
+        eprintln!("usage: slatedb-driver <run|verify|durprobe|remote-run|verify-remote> [flags]");
         std::process::exit(2);
     }
     let sub = argv[1].as_str();
@@ -407,12 +588,16 @@ async fn main() {
         "run" => cmd_run(rest).await,
         "verify" => cmd_verify(rest).await,
         "durprobe" => cmd_durprobe(rest).await,
+        "remote-run" => cmd_remote_run(rest).await,
+        "verify-remote" => cmd_verify_remote(rest).await,
         "-h" | "--help" => {
             println!(
-                "slatedb-driver <run|verify|durprobe>\n\
-                 run      --root <dir> --ack-log <path> --seed <u64> --ops <n> [--head-false-negative <wal_id>]\n\
-                 verify   --root <dir> --ack-log <path> [--head-false-negative <wal_id>]\n\
-                 durprobe --root <dir> --seed <u64> [--keys <n>]"
+                "slatedb-driver <run|verify|durprobe|remote-run|verify-remote>\n\
+                 run           --root <dir> --ack-log <path> --seed <u64> --ops <n> [--head-false-negative <wal_id>]\n\
+                 verify        --root <dir> --ack-log <path> [--head-false-negative <wal_id>]\n\
+                 durprobe      --root <dir> --seed <u64> [--keys <n>]\n\
+                 remote-run    --root <dir> --remote-log <path> --seed <u64> --ops <n> [--durable-every <n>]\n\
+                 verify-remote --root <dir> --remote-log <path>"
             );
         }
         other => {
