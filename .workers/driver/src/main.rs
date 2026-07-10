@@ -102,11 +102,19 @@ fn build_object_store(root: &str, head_fn_wal_id: Option<u64>) -> Arc<dyn Object
 }
 
 async fn open_db(root: &str, head_fn_wal_id: Option<u64>) -> Db {
-    let store = build_object_store(root, head_fn_wal_id);
-    Db::builder(OsPath::from(root), store)
-        .build()
+    open_db_result(root, head_fn_wal_id)
         .await
         .unwrap_or_else(|e| panic!("Db::builder({root}).build(): {e}"))
+}
+
+/// Fallible open — used by `verify` so a reopen that fails under the injected
+/// false-negative HEAD is recorded as a machine-readable outcome
+/// (`VERIFY_OPEN_FAILED`) rather than an opaque panic. A LOUD open failure is a
+/// distinct outcome from a silently-truncated-but-successful reopen; the oracle
+/// must not conflate the two.
+async fn open_db_result(root: &str, head_fn_wal_id: Option<u64>) -> Result<Db, slatedb::Error> {
+    let store = build_object_store(root, head_fn_wal_id);
+    Db::builder(OsPath::from(root), store).build().await
 }
 
 // ---------------------------------------------------------------------------
@@ -180,7 +188,17 @@ async fn cmd_verify(args: &[String]) {
     let head_false_negative: Option<u64> =
         flag(args, "--head-false-negative").map(|s| s.parse().expect("--head-false-negative u64"));
 
-    let db = open_db(&root, head_false_negative).await;
+    // A reopen that fails under the injected false-negative HEAD is a LOUD,
+    // detected failure — not silent data-loss. Emit a machine-readable line and
+    // exit 0 so the python oracle plane can classify it (and cross-check the
+    // acked set with a fault-free control verify) instead of seeing a panic.
+    let db = match open_db_result(&root, head_false_negative).await {
+        Ok(db) => db,
+        Err(e) => {
+            println!("VERIFY_OPEN_FAILED err={e:?}");
+            return;
+        }
+    };
 
     let f = File::open(&ack_log).unwrap_or_else(|e| panic!("open ack-log {ack_log}: {e}"));
     let reader = BufReader::new(f);

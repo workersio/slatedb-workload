@@ -171,6 +171,64 @@ def kill_after_acks(seed: int) -> int:
 
 
 # ---------------------------------------------------------------------------
+# WAL-object discovery (wal-head-contiguity case)
+# ---------------------------------------------------------------------------
+
+
+def discover_wal_objects(root: str):
+    """Return {wal_id: size_bytes} for every `.../wal/{id:020}.sst` under root.
+
+    The driver opens `LocalFileSystem::new_with_prefix(root)` AND passes `root`
+    as the Db path, so objects physically nest at `<root>/<root>/wal/*.sst`;
+    rglob makes discovery agnostic to that nesting.
+    """
+    out: dict[int, int] = {}
+    for p in Path(root).rglob("*.sst"):
+        if p.parent.name != "wal":
+            continue
+        try:
+            wal_id = int(p.stem)
+        except ValueError:
+            continue
+        out[wal_id] = p.stat().st_size
+    return out
+
+
+def pick_head_fn_target(seed: int, wal_objs: dict[int, int]):
+    """Seed-derive the WAL id whose HEAD probe verify will falsify.
+
+    Attack requirement: lie about a REAL object in the un-manifested tail that
+    sits BELOW at least one ACK-BEARING WAL id — so that IF the frontier search
+    truncated at/below the target, a durable acked write in a higher WAL object
+    would be lost. Empty WAL objects (the fence barriers, 0 bytes) carry no ack;
+    a non-empty WAL SST is our proxy for "contains acked data".
+
+    Returns (target_id, reason) where target_id is None if no non-vacuous target
+    exists (the caller VOIDs with `reason`).
+    """
+    if not wal_objs:
+        return None, "no WAL objects on disk"
+    ack_bearing = sorted(i for i, sz in wal_objs.items() if sz > 0)
+    if not ack_bearing:
+        return None, "no non-empty (ack-bearing) WAL objects"
+    top_ack = max(ack_bearing)
+    # Candidates: any real WAL object strictly below the highest ack-bearing id,
+    # so there is guaranteed to be >=1 acked write in a WAL id > target.
+    candidates = sorted(i for i in wal_objs if i < top_ack)
+    if not candidates:
+        return None, (
+            f"only one ack-bearing WAL id ({top_ack}); no tail id below it to "
+            f"lie about → truncation could not lose data"
+        )
+    import hashlib
+    h = int.from_bytes(
+        hashlib.sha256(f"{seed}:wal_head_contiguity_target".encode()).digest()[:4], "big"
+    )
+    target = candidates[h % len(candidates)]
+    return target, f"chosen from {len(candidates)} tail candidate(s) below top ack-bearing id {top_ack}"
+
+
+# ---------------------------------------------------------------------------
 # baseline case
 # ---------------------------------------------------------------------------
 
@@ -443,6 +501,189 @@ def case_crash_mid_flush(seed: int) -> int:
 
 
 # ---------------------------------------------------------------------------
+# wal-head-contiguity case
+# ---------------------------------------------------------------------------
+
+
+def case_wal_head_contiguity(seed: int) -> int:
+    """SIGKILL leaves an un-manifested WAL tail; reopen (`verify`) runs with a
+    false-negative HEAD on one seed-derived tail WAL id. If the frontier search
+    (tablestore.rs:163-273) truncates replay, an acked write in a higher WAL
+    object is lost = data-loss RED. Otherwise the fence-barrier Create walk
+    (fence.rs:143-172) self-corrects → GREEN.
+    """
+    selftest = durawatch.selftest_active()
+
+    # ack-log lives OUTSIDE the db root (fault wrapper / crash must never corrupt it).
+    root = tempfile.mkdtemp(prefix="slatedb-ack-root-")
+    ack_fd, ack_log = tempfile.mkstemp(prefix="slatedb-ack-", suffix=".log")
+    os.close(ack_fd)
+    os.unlink(ack_log)  # let the driver create it fresh (append semantics)
+
+    # --- declared fault timing: SIGKILL after the seed-derived K-th ack -------
+    # Same ACK-PROGRESS trigger as crash-mid-flush → leaves acked WAL objects on
+    # disk BEYOND the last manifest update (no L0 flush at this depth, so
+    # replay_after_wal_id stays 0 and the whole WAL tail is un-manifested).
+    kill_k = kill_after_acks(seed)
+
+    emit(f"CASE wal-head-contiguity seed={seed} ops={CRASH_OPS} root={root} ack_log={ack_log}")
+    emit(f"CLOCK wal-head-contiguity armed kind=ack_progress axis=wal_head_contiguity "
+         f"kill_after_acks={kill_k} max_acks={CRASH_KILL_MAX_ACKS} seed={seed}")
+
+    proc = subprocess.Popen(
+        [str(DRIVER), "run", "--root", root, "--ack-log", ack_log,
+         "--seed", str(seed), "--ops", str(CRASH_OPS)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    t_start = time.time()
+    deadline = t_start + CRASH_KILL_DEADLINE_S
+    while True:
+        if count_acked(ack_log) >= kill_k:
+            break
+        if proc.poll() is not None:
+            break
+        if time.time() > deadline:
+            break
+        time.sleep(0.03)
+
+    kill_mode = "already_dead"
+    if proc.poll() is None:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        kill_mode = "sigkill(pg)"
+    proc.wait()
+    killed_rc = proc.returncode
+    kill_wall = time.time() - t_start
+
+    acked = read_acked(ack_log) if os.path.exists(ack_log) else []
+    n_pre = len(acked)
+
+    # --- discover the un-manifested WAL tail + pick the false-HEAD target -----
+    wal_objs = discover_wal_objects(root)
+    wal_ids = sorted(wal_objs)
+    layout = ",".join(f"{i}:{wal_objs[i]}b" for i in wal_ids)
+    emit(f"KILLED mode={kill_mode} rc={killed_rc} acked_before_kill={n_pre} "
+         f"kill_after={kill_k} kill_wall={kill_wall:.3f}s ops={CRASH_OPS}")
+    emit(f"WAL_TAIL ids=[{','.join(map(str, wal_ids))}] sizes=[{layout}]")
+
+    # --- anti-vacuity floors --------------------------------------------------
+    if killed_rc == 0:
+        disarm_liveness(True, "kill missed window (run completed)")
+        emit(f"VERDICT: VOID — run completed all {CRASH_OPS} ops before the K-th ack "
+             f"kill; raise SLATEDB_CRASH_OPS. seed={seed} kill_after={kill_k}")
+        return 3
+    if n_pre < 2:
+        disarm_liveness(True, "kill too early — <2 acked writes")
+        emit(f"VERDICT: VOID — need >=2 acked writes to make truncation lossy; "
+             f"n_pre={n_pre} seed={seed} kill_after={kill_k}")
+        return 3
+
+    target, reason = pick_head_fn_target(seed, wal_objs)
+    if target is None:
+        disarm_liveness(True, "no non-vacuous head-fn target")
+        emit(f"VERDICT: VOID — {reason}; seed={seed} wal_ids={wal_ids}")
+        return 3
+
+    # The wrapper must lie about a REAL object; it came from the on-disk listing.
+    assert target in wal_objs, f"target {target} not on disk"
+    higher_ack = [i for i in wal_ids if i > target and wal_objs[i] > 0]
+    emit(f"HEADFN target_wal_id={target} ({reason}); "
+         f"ack_bearing_wal_ids_above_target={higher_ack}")
+    if not higher_ack:
+        disarm_liveness(True, "no ack-bearing WAL above target")
+        emit(f"VERDICT: VOID — no ack-bearing WAL id above target {target}; "
+             f"truncation could not lose an acked write. seed={seed}")
+        return 3
+
+    # --- ORACLE_SELFTEST: plant a fake acked key the DB never wrote -----------
+    if selftest:
+        with open(ack_log, "a") as f:
+            f.write("999999\tSELFTEST_MISSING\tselftest-injected\n")
+            f.flush()
+            os.fsync(f.fileno())
+        emit("ORACLE_SELFTEST: injected fake acked line key=SELFTEST_MISSING "
+             "(verify must report LOST → wal-head-contiguity oracle must go RED)")
+        acked = read_acked(ack_log)
+
+    # --- FAULT verify: FIRST reopen with the false-negative HEAD on target ----
+    # This is the attack: the false HEAD is active during the un-manifested-tail
+    # replay. Three possible outcomes, which the oracle MUST distinguish:
+    #   (a) opens + all acked present   → frontier did not truncate (GREEN)
+    #   (b) opens + acked keys MISSING  → SILENT truncation = data-loss RED
+    #   (c) VERIFY_OPEN_FAILED (loud)   → reopen erred loudly under the fault;
+    #       NOT silent loss. Cross-check the acked set with a fault-free CONTROL
+    #       verify (ground truth: did the crash actually lose data?).
+    fault = run_driver(
+        ["verify", "--root", root, "--ack-log", ack_log,
+         "--head-false-negative", str(target)]
+    )
+    sys.stdout.write(fault.stdout)
+    sys.stdout.flush()
+    fault_open_failed = "VERIFY_OPEN_FAILED" in fault.stdout
+    f_verdict, f_ok, f_checked, f_lost, f_mismatch, f_bad = parse_verify(fault.stdout)
+
+    if fault_open_failed:
+        # (c) LOUD reopen failure. Record it as a distinct observation, then use a
+        # fault-free control verify as the durability ground truth.
+        emit(f"HEADFN_REOPEN_LOUD_FAILURE wal_id={target}: reopen returned an error "
+             f"(false-negative HEAD on a to-be-replayed WAL SST) — detected, not "
+             f"silent. A truthful/retrying object store recovers this; the acked "
+             f"bytes are durably present on disk.")
+        ctrl = run_driver(["verify", "--root", root, "--ack-log", ack_log])
+        sys.stdout.write(ctrl.stdout)
+        sys.stdout.flush()
+        verdict_seen, subset_ok, checked, lost, mismatch, bad_keys = parse_verify(ctrl.stdout)
+        source = "control(fault-free reopen)"
+    else:
+        # (a)/(b): the fault reopen itself produced a verdict — that IS the
+        # answer. A missing/stale key here is genuine SILENT data-loss.
+        verdict_seen, subset_ok, checked, lost, mismatch, bad_keys = (
+            f_verdict, f_ok, f_checked, f_lost, f_mismatch, f_bad)
+        source = "fault(false-HEAD reopen)"
+        if fault.returncode != 0 and not verdict_seen:
+            emit(f"DRIVER verify failed rc={fault.returncode}\n{fault.stderr}")
+
+    # --- terminal-state sweep -------------------------------------------------
+    n_acked = len(acked)
+    terminal_ok = verdict_seen and checked == n_acked
+    invariant(
+        "terminal_state", "acked-keys-resolved", terminal_ok,
+        f"[{source}] verify emitted verdict for {checked}/{n_acked} acked keys "
+        f"after SIGKILL + false-HEAD(wal_id={target})"
+        if terminal_ok else
+        f"[{source}] no full verdict (verdict_seen={verdict_seen} "
+        f"checked={checked} expected={n_acked})",
+    )
+
+    # --- durable_ack_subset: the bespoke A ⊆ R (silent-loss) verdict ----------
+    # PASS iff the acked set is fully recoverable (silent loss did NOT occur).
+    # A loud reopen failure (c) with a clean control is a PASS for THIS oracle —
+    # the promise under attack is *silent* data-loss (sev 4); the loud failure is
+    # reported separately above.
+    subset_pass = terminal_ok and subset_ok and lost == 0 and mismatch == 0
+    summary = (f"[{source}] checked={checked} lost={lost} mismatch={mismatch} "
+               f"bad={sorted(bad_keys)[:8]} seed={seed} kill_after={kill_k} "
+               f"head_fn_wal_id={target}")
+    invariant("durable_ack_subset", "acked-subset-readable", subset_pass, summary)
+
+    if not subset_pass:
+        disarm_liveness(True, "verdict reached (durable_ack_subset FAIL)")
+        emit(f"VERDICT: RED — acked writes not recoverable: {summary}")
+        emit(f"REPLAY red: SEED={seed} case=wal-head-contiguity head_fn_wal_id={target} "
+             f"acked_before_kill={n_pre} wal_ids={wal_ids} lost_keys={sorted(bad_keys)} "
+             f"source={source}")
+        return 1
+
+    disarm_liveness(True, "verdict reached (durable_ack_subset PASS)")
+    # durawatch: re-observe across reopen (fault-free rungs, so a delayed erasure
+    # would still surface).
+    run_durawatch_ladder("durable_ack_wal_head_contiguity", root, ack_log, acked)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # entry
 # ---------------------------------------------------------------------------
 
@@ -472,7 +713,7 @@ def main() -> int:
     if args.case == "crash-mid-flush":
         return case_crash_mid_flush(seed)
     if args.case == "wal-head-contiguity":
-        raise NotImplementedError("executor fills next episode")
+        return case_wal_head_contiguity(seed)
     raise NotImplementedError(f"unknown case {args.case!r}")
 
 
