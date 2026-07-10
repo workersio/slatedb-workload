@@ -14,14 +14,14 @@ explorations:
     description: >-
       No faults. Proves the driver + oracle observe the invariant at all: every
       acked key is present with the right value after a clean close+reopen.
-    status: ready
-    result: null
+    status: done
+    result: green
     reason: null
     workload: workloads/durable_ack.py
     command: python3 .workers/workloads/durable_ack.py --case baseline
     faults: []
     depth: 10
-    replay: null
+    replay: {run: "01KX5Y6CBAG0JDG3GA8CQ38KKD", case: baseline, seed: 3}
     freshness: new-current
     reported: null
     published: null
