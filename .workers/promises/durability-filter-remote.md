@@ -25,7 +25,7 @@ explorations:
     replay: {run: "nd76yqtq10k1s278byrn0e9q018a971z", case: baseline, seed: 3}
     freshness: new-current
     reported: null
-    published: null
+    published: nd7ebhm66gftheeam63ftjrmgx8a99jp
   - key: durability-filter-remote-crash-confirm
     title: Remote read-set survives crash
     description: >-
