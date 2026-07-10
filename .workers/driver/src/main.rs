@@ -21,7 +21,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
-use slatedb::config::{PutOptions, WriteOptions};
+use slatedb::config::{DurabilityLevel, PutOptions, ReadOptions, Settings, WriteOptions};
 use slatedb::object_store::path::Path as OsPath;
 use slatedb::Db;
 
@@ -250,11 +250,155 @@ async fn cmd_verify(args: &[String]) {
     // Always exit 0 — the python oracle plane owns the verdict.
 }
 
+// ---------------------------------------------------------------------------
+// durprobe — Memory/Remote durability-filter discrimination (non-vacuity ctrl)
+//
+// Deterministically demonstrates that a value written await_durable=false is:
+//   * visible to a Memory-filter read (it lives in the in-memory memtable/WAL),
+//   * ABSENT from a Remote-filter read (Remote gates on last_remote_persisted_seq
+//     — reader.rs:112-113 — so a not-yet-flushed seq is filtered out),
+//   * visible to a Remote-filter read AFTER an explicit db.flush().
+//
+// Determinism: open with flush_interval=None so an await_durable=false write is
+// NEVER auto-flushed to object storage until we call db.flush() explicitly. With
+// the default 100ms flush the dirty window is a race; disabling it makes the
+// Memory/Remote divergence a hard invariant, not a timing artifact.
+//
+// Emits one machine-readable DURPROBE line per key plus a DURPROBE_SUMMARY.
+// Always exits 0 — the python oracle plane owns the verdict.
+// ---------------------------------------------------------------------------
+
+async fn open_db_no_auto_flush(root: &str) -> Db {
+    let store = build_object_store(root, None);
+    // flush_interval=None disables automatic flushing: an await_durable=false
+    // write stays in-memory (Memory-visible, Remote-invisible) until db.flush().
+    // (config.rs:633-634; exercised by db.rs::test_no_flush_interval.)
+    let settings = Settings {
+        flush_interval: None,
+        ..Default::default()
+    };
+    Db::builder(OsPath::from(root), store)
+        .with_settings(settings)
+        .build()
+        .await
+        .unwrap_or_else(|e| panic!("Db::builder({root}).with_settings(..).build(): {e}"))
+}
+
+fn hit(got: &Option<Bytes>, expected: &str) -> bool {
+    matches!(got, Some(b) if b.as_ref() == expected.as_bytes())
+}
+
+fn hitstr(h: bool) -> &'static str {
+    if h {
+        "hit"
+    } else {
+        "miss"
+    }
+}
+
+async fn cmd_durprobe(args: &[String]) {
+    let root = require(args, "--root");
+    let seed: u64 = require(args, "--seed").parse().expect("--seed u64");
+    let keys: u64 = flag(args, "--keys")
+        .map(|s| s.parse().expect("--keys u64"))
+        .unwrap_or(8);
+
+    let db = open_db_no_auto_flush(&root).await;
+
+    let put_opts = PutOptions::default();
+    // The core: await_durable=false returns BEFORE the write is object-store
+    // durable. With flush_interval=None it stays purely in-memory until flush().
+    let write_opts = WriteOptions {
+        await_durable: false,
+        ..Default::default()
+    };
+    let read_memory = ReadOptions {
+        durability_filter: DurabilityLevel::Memory,
+        ..Default::default()
+    };
+    let read_remote = ReadOptions {
+        durability_filter: DurabilityLevel::Remote,
+        ..Default::default()
+    };
+
+    // Materialize the deterministic (key,value) stream up front so the
+    // after-flush Remote re-read checks the exact same values.
+    let mut rng = XorShift64::new(seed);
+    let kvs: Vec<(String, String)> = (0..keys).map(|seq| op_kv(&mut rng, seq)).collect();
+
+    let mut mem_dirty_hits: u64 = 0;
+    let mut remote_dirty_hits: u64 = 0;
+    // Per-key dirty-window observations (printed after the flushed re-read so
+    // each DURPROBE line carries all three fields together).
+    let mut mem_dirty: Vec<bool> = Vec::with_capacity(kvs.len());
+    let mut remote_dirty: Vec<bool> = Vec::with_capacity(kvs.len());
+
+    for (key, value) in &kvs {
+        // 1. put await_durable=false — returns before durable.
+        db.put_with_options(key.as_bytes(), value.as_bytes(), &put_opts, &write_opts)
+            .await
+            .unwrap_or_else(|e| panic!("put {key}: {e}"));
+
+        // 2. Memory read — EXPECT present (in-memory, seq <= last_committed_seq).
+        let mem = db
+            .get_with_options(key.as_bytes(), &read_memory)
+            .await
+            .unwrap_or_else(|e| panic!("get(memory) {key}: {e}"));
+        let mem_h = hit(&mem, value);
+        if mem_h {
+            mem_dirty_hits += 1;
+        }
+        mem_dirty.push(mem_h);
+
+        // 3. Remote read — EXPECT absent (seq > last_remote_persisted_seq).
+        let rem = db
+            .get_with_options(key.as_bytes(), &read_remote)
+            .await
+            .unwrap_or_else(|e| panic!("get(remote) {key}: {e}"));
+        let rem_h = hit(&rem, value);
+        if rem_h {
+            remote_dirty_hits += 1;
+        }
+        remote_dirty.push(rem_h);
+    }
+
+    // 4. Make the whole dirty window durable, then re-read each with Remote.
+    db.flush()
+        .await
+        .unwrap_or_else(|e| panic!("db.flush(): {e}"));
+
+    let mut remote_flushed_hits: u64 = 0;
+    for (i, (key, value)) in kvs.iter().enumerate() {
+        let rem_after = db
+            .get_with_options(key.as_bytes(), &read_remote)
+            .await
+            .unwrap_or_else(|e| panic!("get(remote,post-flush) {key}: {e}"));
+        let raf_h = hit(&rem_after, value);
+        if raf_h {
+            remote_flushed_hits += 1;
+        }
+        println!(
+            "DURPROBE key={key} memory_dirty={} remote_dirty={} remote_after_flush={}",
+            hitstr(mem_dirty[i]),
+            hitstr(remote_dirty[i]),
+            hitstr(raf_h),
+        );
+    }
+
+    db.close().await.expect("db.close");
+
+    println!(
+        "DURPROBE_SUMMARY keys={} mem_dirty_hits={mem_dirty_hits} \
+         remote_dirty_hits={remote_dirty_hits} remote_flushed_hits={remote_flushed_hits}",
+        kvs.len(),
+    );
+}
+
 #[tokio::main]
 async fn main() {
     let argv: Vec<String> = std::env::args().collect();
     if argv.len() < 2 {
-        eprintln!("usage: slatedb-driver <run|verify> [flags]");
+        eprintln!("usage: slatedb-driver <run|verify|durprobe> [flags]");
         std::process::exit(2);
     }
     let sub = argv[1].as_str();
@@ -262,11 +406,13 @@ async fn main() {
     match sub {
         "run" => cmd_run(rest).await,
         "verify" => cmd_verify(rest).await,
+        "durprobe" => cmd_durprobe(rest).await,
         "-h" | "--help" => {
             println!(
-                "slatedb-driver <run|verify>\n\
-                 run    --root <dir> --ack-log <path> --seed <u64> --ops <n> [--head-false-negative <wal_id>]\n\
-                 verify --root <dir> --ack-log <path> [--head-false-negative <wal_id>]"
+                "slatedb-driver <run|verify|durprobe>\n\
+                 run      --root <dir> --ack-log <path> --seed <u64> --ops <n> [--head-false-negative <wal_id>]\n\
+                 verify   --root <dir> --ack-log <path> [--head-false-negative <wal_id>]\n\
+                 durprobe --root <dir> --seed <u64> [--keys <n>]"
             );
         }
         other => {
