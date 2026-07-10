@@ -42,7 +42,7 @@ explorations:
     replay: {run: "nd7c90vthyg00w26fym9v10r4n8a862b", case: crash-mid-flush, seed: 5}
     freshness: new-current
     reported: null
-    published: null
+    published: pending
   - key: durable-ack-wal-head-contiguity
     title: HEAD-contiguity frontier truncates replay
     description: >-

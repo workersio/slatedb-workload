@@ -7,7 +7,7 @@
 - last-scanned-sha: 016b676ee125f02cb14054cce0cd5a78f3524ac5
 - target-head-sha: 016b676ee125f02cb14054cce0cd5a78f3524ac5
 - re-plan triggers: none
-- publish-pending: []
+- publish-pending: [durable-ack-crash-mid-flush]   # transient convex 503/query blips on 2026-07-10; re-fire publish.py (idempotent) — baseline official already live (nd773r0v)
 - last episode summary: |
     Executor #2 (durable-ack-crash-mid-flush) — GREEN. SIGKILL after the
     seed-derived K-th fsync'd ack (ack-progress trigger, portable: the sim is
