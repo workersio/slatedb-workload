@@ -1,0 +1,33 @@
+# Standalone workload-driver for the SlateDB fault-injection harness.
+#
+# It lives *inside* the slatedb repo tree but must be its OWN workspace root:
+# the repo's root Cargo.toml enumerates explicit members, so without an empty
+# [workspace] table here cargo reports "current package believes it's in a
+# workspace when it's not". The empty table severs it from the parent workspace.
+[workspace]
+
+[package]
+name = "slatedb-driver"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "slatedb-driver"
+path = "src/main.rs"
+
+[dependencies]
+# default-features = false drops the default ["aws","foyer"] set — those pull
+# ring/openssl/io_uring (foyer) that fight musl static linking. LocalFileSystem +
+# InMemory need only the base object_store, which is pure Rust.
+slatedb = { path = "../../slatedb", default-features = false }
+object_store = "0.14.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+bytes = "1"
+async-trait = "0.1"
+futures = "0.3"
+
+[profile.release]
+# Small, self-contained binary for vendoring into the guest image.
+opt-level = 2
+strip = true
