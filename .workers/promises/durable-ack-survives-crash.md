@@ -32,14 +32,14 @@ explorations:
       the driver is SIGKILLed at seed-swept points spanning flush boundaries,
       then reopened. Every key the driver recorded as durably-acked before the
       kill must be present with the correct value after recovery.
-    status: ready
-    result: null
+    status: done
+    result: green
     reason: null
     workload: workloads/durable_ack.py
     command: python3 .workers/workloads/durable_ack.py --case crash-mid-flush
     faults: [process-kill]
     depth: 20
-    replay: null
+    replay: {run: "nd7c90vthyg00w26fym9v10r4n8a862b", case: crash-mid-flush, seed: 5}
     freshness: new-current
     reported: null
     published: null
