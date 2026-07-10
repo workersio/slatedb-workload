@@ -25,7 +25,7 @@ explorations:
     replay: {run: "nd76yqtq10k1s278byrn0e9q018a971z", case: baseline, seed: 3}
     freshness: new-current
     reported: null
-    published: nd7ebhm66gftheeam63ftjrmgx8a99jp
+    published: nd7ejjv5ye9p4w9k8q1ar2txf58a99hd
   - key: durability-filter-remote-crash-confirm
     title: Remote read-set survives crash
     description: >-
@@ -43,7 +43,7 @@ explorations:
     replay: {run: "nd7b60mady5185xbrra7382b118a8efr", case: crash-confirm, seed: 5}
     freshness: new-current
     reported: null
-    published: null
+    published: nd7en9andn26mjhss1s5wsbgcx8a8grn
   - key: durability-filter-remote-inflight-flush
     title: Remote excludes an in-flight (not-yet-durable) value at the flush boundary
     description: >-

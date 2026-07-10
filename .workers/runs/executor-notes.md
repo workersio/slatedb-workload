@@ -39,3 +39,14 @@
   `cd .workers/driver && cargo build --release --target x86_64-unknown-linux-musl`,
   copy to `.workers/vendor/bin/slatedb-driver`. `driver/target/` is gitignored
   (349 MB) — `cargo clean` after big changes.
+
+## Publish efficiency (observed 2026-07-10)
+`publish.py` re-publishes EVERY `status: done` exploration on each run, generating
+a fresh run batch (and new exploration id) each time — so calling it per-episode
+re-executes all prior officials on the shared workers (wasteful under fleet-wide
+load; also churns the `published:` fields → an extra commit each time). It stays
+idempotent-by-key (runs group under the stable exploration key on the page). To
+reduce redundant compute, prefer publishing once at wrap-up, or extend publish.py
+to skip explorations already published at the current HEAD. Convex also threw
+transient 503 OCC / query blips under fleet load — retries clear them; mark
+`published: pending` and let wrap-up re-fire if a publish fails.
