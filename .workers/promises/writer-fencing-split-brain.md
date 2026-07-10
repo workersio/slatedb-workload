@@ -26,7 +26,7 @@ explorations:
     replay: {run: "nd7ejybh1y7kg4tzmgr85btthn8a9x1q", case: baseline, seed: 5}
     freshness: new-current
     reported: null
-    published: null
+    published: pending
   - key: fencing-split-brain-overlap-writes
     title: Overlapping concurrent writers, no lost update / no zombie data
     description: >-

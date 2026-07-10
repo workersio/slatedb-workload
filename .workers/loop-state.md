@@ -7,7 +7,7 @@
 - last-scanned-sha: 016b676ee125f02cb14054cce0cd5a78f3524ac5
 - target-head-sha: 016b676ee125f02cb14054cce0cd5a78f3524ac5
 - re-plan triggers: none
-- publish-pending: [durability-filter-remote-inflight-flush]   # transient convex OCC; 5 officials live, re-fire publish.py for this last one
+- publish-pending: [durability-filter-remote-inflight-flush, fencing-split-brain-baseline]   # convex OCC under fleet load; DEFER publishing — do NOT call publish.py per-episode (it re-runs ALL done explorations each time = wasteful churn + repeated OCC). Publish ONCE at a genuine wrap-up when convex is calm, or after teaching publish.py to skip already-published-at-HEAD. 6 officials already live.
 - last episode summary: |
     Executor #7 (fencing-split-brain-baseline) — GREEN. Two-process fencing
     (fence-victim/fence-usurper on one LocalFileSystem root); superseded put →
