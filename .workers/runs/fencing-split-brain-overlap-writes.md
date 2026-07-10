@@ -78,3 +78,18 @@ this oracle's `open_nanos` cutoff that write WOULD be a suspect, so the in-guest
 environment (slower I/O widening the fence.rs:167 retry window) is where this rung
 actually adjudicates the zombie oracle. The oracle is proven correct and non-vacuous
 by the selftest; no split-brain / lost-update was found on-box.
+
+## In-guest confirmation (executor #8, exploration nd7d9wr18jjbcbnvr9ffs1gdgd8a8vhx, depth 10)
+All 10 in-guest runs VOID — `post_fence_suspects=0` every seed (e.g. seed
+1906796196: victim landed 3 `ok` acks but ALL resolved before the usurper's
+`open_nanos`; attempt 3 was Fenced). The zombie window never opens in-guest
+either. **Conclusion:** SlateDB's fence is airtight — no durable victim write
+survives (or even lands) after the usurper's epoch bump. The split-brain/zombie
+corridor is structurally unreachable via "victim keeps writing after usurper
+opens" (`fence.rs:145-171` advances the WAL barrier past any id the incumbent
+grabs → its next flush is Fenced via `PutMode::Create`, `tablestore.rs:1125,1133`;
+any already-committed victim write is below the barrier, folded into the
+usurper's replay_range `fence.rs:165`, then superseded). Recorded `blocked`
+(anti-vacuity VOID, not a hollow green). The remaining reachable fence-boundary
+variant — a victim flush already IN FLIGHT when the barrier lands — is
+`stale-epoch-flush` (rung 3). Producer to triage: retire or fold into rung 3.

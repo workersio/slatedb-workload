@@ -1,14 +1,33 @@
 # Loop state
 - rails: { loops: 100, workloads: 250 }   # defaults — safety rails, not targets
-- counters: { episodes: 9, producer: 2, executor: 7, workloads: 7 }
+- counters: { episodes: 10, producer: 2, executor: 8, workloads: 8 }
 - no-new-info: { streak: 0, K: 5 }
 - in-flight unit: none
-- re-entry: fencing-split-brain-baseline → deepen — GREEN (2nd open fences 1st) BUT surfaced a concrete LEAD: the victim landed ONE ok await_durable write (seq 2) AFTER the usurper opened+acked, before being fenced (victim_ok_after_prelude=1). Next rung overlap-writes must reopen and check whether that post-fence ok-write is a durable ZOMBIE (split-brain / lost-update RED). No L decay (baseline green); the near-miss boundary aims overlap-writes.
+- re-entry: none
 - last-scanned-sha: 016b676ee125f02cb14054cce0cd5a78f3524ac5
 - target-head-sha: 016b676ee125f02cb14054cce0cd5a78f3524ac5
-- re-plan triggers: none
+- re-plan triggers: executor-bounce-back — fencing-split-brain-overlap-writes BLOCKED (zombie window structurally unreachable, fence airtight; anti-vacuity VOID on-box+in-guest). PRODUCER TRIAGE: retire the rung as certified-unreachable OR fold into stale-epoch-flush (rung 3, the in-flight-buffered-flush variant). Cite fence.rs:145-171 + tablestore.rs:1125,1133.
 - publish-pending: [durability-filter-remote-inflight-flush, fencing-split-brain-baseline]   # convex OCC under fleet load; DEFER publishing — do NOT call publish.py per-episode (it re-runs ALL done explorations each time = wasteful churn + repeated OCC). Publish ONCE at a genuine wrap-up when convex is calm, or after teaching publish.py to skip already-published-at-HEAD. 6 officials already live.
 - last episode summary: |
+    Executor #8 (fencing-split-brain-overlap-writes) — BLOCKED (anti-vacuity VOID,
+    honest). The zombie/split-brain corridor is structurally UNREACHABLE: the
+    fence is airtight — no durable victim write lands after the usurper's epoch
+    bump (post_fence_suspects=0 across 49 on-box + 10 in-guest seeds). Source:
+    fence.rs:145-171 advances the WAL barrier past incumbent ids → next victim
+    flush Fenced (tablestore.rs:1125,1133 PutMode::Create). Oracle non-vacuous
+    (selftest RED). This is a STRONGER guarantee than the promise asked — SlateDB
+    prevents post-fence writes from being acked at all. Evidence:
+    runs/fencing-split-brain-overlap-writes.md. Re-plan trigger set.
+
+    RESUME POINTER (fresh session): dispatcher row 4 (re-plan trigger) → PRODUCER
+    TRIAGE episode: decide overlap-writes — retire as certified-unreachable
+    (like the clone pin + wal-head-contiguity refutations) OR fold into
+    stale-epoch-flush (rung 3), which tests the ONE remaining reachable variant:
+    a victim flush already IN FLIGHT (WAL PUT started) when the barrier lands —
+    does it complete durably? Then clear the trigger; row 5 → executor on
+    stale-epoch-flush + compacted-gc (2 rungs ready). Note: the fencing baseline
+    green stands; only the overlap rung is unreachable-as-framed.
+
     Executor #7 (fencing-split-brain-baseline) — GREEN. Two-process fencing
     (fence-victim/fence-usurper on one LocalFileSystem root); superseded put →
     ErrorKind::Closed(CloseReason::Fenced) (error.rs:115,618; fence.rs:342-354).

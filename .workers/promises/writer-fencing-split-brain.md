@@ -35,9 +35,9 @@ explorations:
       single-writer history: no key reflects an A-write that landed AFTER B
       fenced A (no zombie durable write), and no committed B-write is lost or
       resurrected to an A-value. Adversarial: races the fence boundary.
-    status: ready
-    result: null
-    reason: null
+    status: done
+    result: blocked
+    reason: "zombie window structurally unreachable — every post-epoch-bump victim flush is Fenced (fence.rs:145-171 barrier-advance + tablestore.rs:1125,1133 PutMode::Create); post_fence_suspects=0 across 49 on-box + 10 in-guest seeds → anti-vacuity VOID. Fence is airtight (stronger than the promise). Producer: retire OR re-aim to the IN-FLIGHT buffered-flush variant (converges with stale-epoch-flush rung 3)."
     workload: workloads/fencing.py
     command: python3 .workers/workloads/fencing.py --case overlap-writes
     faults: [process-kill]
