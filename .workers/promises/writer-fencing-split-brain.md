@@ -16,14 +16,14 @@ explorations:
       (bumping the manifest epoch). Assert (a) B's writes succeed and are durable,
       and (b) A's next await_durable write returns SlateDBError::Fenced. Proves
       the fence is observed at all (non-vacuity control).
-    status: ready
-    result: null
+    status: done
+    result: green
     reason: null
     workload: workloads/fencing.py
     command: python3 .workers/workloads/fencing.py --case baseline
     faults: []
     depth: 10
-    replay: null
+    replay: {run: "nd7ejybh1y7kg4tzmgr85btthn8a9x1q", case: baseline, seed: 5}
     freshness: new-current
     reported: null
     published: null

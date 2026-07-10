@@ -1,14 +1,34 @@
 # Loop state
 - rails: { loops: 100, workloads: 250 }   # defaults — safety rails, not targets
-- counters: { episodes: 8, producer: 2, executor: 6, workloads: 6 }
+- counters: { episodes: 9, producer: 2, executor: 7, workloads: 7 }
 - no-new-info: { streak: 0, K: 5 }
 - in-flight unit: none
-- re-entry: none
+- re-entry: fencing-split-brain-baseline → deepen — GREEN (2nd open fences 1st) BUT surfaced a concrete LEAD: the victim landed ONE ok await_durable write (seq 2) AFTER the usurper opened+acked, before being fenced (victim_ok_after_prelude=1). Next rung overlap-writes must reopen and check whether that post-fence ok-write is a durable ZOMBIE (split-brain / lost-update RED). No L decay (baseline green); the near-miss boundary aims overlap-writes.
 - last-scanned-sha: 016b676ee125f02cb14054cce0cd5a78f3524ac5
 - target-head-sha: 016b676ee125f02cb14054cce0cd5a78f3524ac5
 - re-plan triggers: none
 - publish-pending: [durability-filter-remote-inflight-flush]   # transient convex OCC; 5 officials live, re-fire publish.py for this last one
 - last episode summary: |
+    Executor #7 (fencing-split-brain-baseline) — GREEN. Two-process fencing
+    (fence-victim/fence-usurper on one LocalFileSystem root); superseded put →
+    ErrorKind::Closed(CloseReason::Fenced) (error.rs:115,618; fence.rs:342-354).
+    Victim fenced after usurper open; usurper durable; selftest red.
+    **LEAD for the next rung:** in-guest the victim landed ONE ok await_durable
+    write AFTER the usurper opened before being fenced — overlap-writes must
+    check if that post-fence write is a durable zombie (potential split-brain
+    RED). Evidence: runs/fencing-split-brain-baseline.md.
+
+    RESUME POINTER (fresh session): dispatcher row 5 → executor on
+    **fencing-split-brain-overlap-writes** (status: ready) — the adversarial rung
+    with a CONCRETE hypothesis: A and B write overlapping keys across the B-open
+    fence; reopen and assert the final durable state is a valid single-writer
+    history — any surviving post-fence victim value = split-brain/lost-update RED.
+    The baseline proved the post-open ok-write window exists (victim_ok_after_
+    prelude=1); this rung falsifies whether it persists durably. Reuses
+    fence-victim/fence-usurper; add the single-writer-history verify. Then
+    stale-epoch-flush, then compacted-gc (2 rungs ready), then finish clone.
+    Driver subcommands + gotchas in runs/executor-notes.md. Nothing in flight.
+
     Producer #2 (backlog promotion, strategy-critic-gated). Promoted 3 corridors;
     the critic (source-verified) REDO caught two structural traps and I applied
     all: (1) clone-consistency invariant-3 (referential FileNotFound) is PINNED —
