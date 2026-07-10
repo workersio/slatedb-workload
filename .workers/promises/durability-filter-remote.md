@@ -33,14 +33,14 @@ explorations:
       seed-swept SIGKILL; after reopen the surviving state MUST be a superset of
       that Remote read-set (Remote never showed a value that then vanished).
       Interleave await_durable=false writers so Memory and Remote diverge.
-    status: ready
-    result: null
+    status: done
+    result: green
     reason: null
     workload: workloads/durability_filter.py
     command: python3 .workers/workloads/durability_filter.py --case crash-confirm
     faults: [process-kill]
     depth: 20
-    replay: null
+    replay: {run: "nd7b60mady5185xbrra7382b118a8efr", case: crash-confirm, seed: 5}
     freshness: new-current
     reported: null
     published: null
