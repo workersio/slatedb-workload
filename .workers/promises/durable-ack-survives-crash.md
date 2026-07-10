@@ -24,7 +24,7 @@ explorations:
     replay: {run: "01KX5Y6CBAG0JDG3GA8CQ38KKD", case: baseline, seed: 3}
     freshness: new-current
     reported: null
-    published: nd773r0vv83vyqgz37gawwy7s98a889n
+    published: nd7db1rkv2qqaj1q1cxj0p1j5h8a9wv6
   - key: durable-ack-crash-mid-flush
     title: SIGKILL mid-flush, acked writes survive
     description: >-
@@ -42,7 +42,7 @@ explorations:
     replay: {run: "nd7c90vthyg00w26fym9v10r4n8a862b", case: crash-mid-flush, seed: 5}
     freshness: new-current
     reported: null
-    published: pending
+    published: nd72ajfy6cvs4f9tema3b246jd8a8axv
   - key: durable-ack-wal-head-contiguity
     title: HEAD-contiguity frontier truncates replay
     description: >-
@@ -66,7 +66,7 @@ explorations:
     replay: {run: "nd7f7ygzkt1tbyzgn6w5n47szh8a9tmk", case: wal-head-contiguity, seed: 5}
     freshness: new-current
     reported: null
-    published: null
+    published: nd7epmpg8f3e06h8ghgh3970ex8a85jq
 ---
 # Durable acks survive crash and restart
 

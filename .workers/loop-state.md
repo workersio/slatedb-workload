@@ -7,7 +7,7 @@
 - last-scanned-sha: 016b676ee125f02cb14054cce0cd5a78f3524ac5
 - target-head-sha: 016b676ee125f02cb14054cce0cd5a78f3524ac5
 - re-plan triggers: none
-- publish-pending: [durable-ack-crash-mid-flush, durable-ack-wal-head-contiguity]   # transient convex 503 OCC (fleet-wide load 2026-07-10); re-fire publish.py — baseline official live (nd773r0v)
+- publish-pending: []   # all 3 durable-ack officials live (baseline nd7db1rk, crash-mid-flush nd72ajfy, wal-head-contiguity nd7epmpg)
 - last episode summary: |
     Executor #3 (durable-ack-wal-head-contiguity) — GREEN, the genuine-bug
     candidate. Silent-truncation hypothesis REFUTED (source-verified): a
