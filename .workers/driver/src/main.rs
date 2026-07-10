@@ -25,6 +25,7 @@ use slatedb::config::{DurabilityLevel, PutOptions, ReadOptions, Settings, WriteO
 use slatedb::object_store::path::Path as OsPath;
 use slatedb::Db;
 
+mod block_put;
 mod head_fn;
 
 // ---------------------------------------------------------------------------
@@ -575,6 +576,145 @@ async fn cmd_verify_remote(args: &[String]) {
     // Always exit 0 — the python oracle plane owns the verdict.
 }
 
+// ---------------------------------------------------------------------------
+// inflight-probe — Remote excludes an in-flight (not-yet-durable) value at the
+// exact flush boundary where the WAL SST PUT has been issued but has NOT yet
+// completed.
+//
+// Mechanism: open with flush_interval=None (no auto-flush) behind a BlockWalPut
+// wrapper that HOLDS the WAL SST PUT (put_opts on .../wal/{id}.sst) in-flight
+// until released. Write N await_durable=false keys (in the WAL buffer, not
+// durable). Arm the block, then trigger db.flush() on a background task — its
+// WAL PUT enters the wrapper and blocks. WHILE the PUT is blocked (the value's
+// WAL object is provably not yet persisted — a crash here loses it), read every
+// key with DurabilityLevel::Remote: each MUST be a miss (the Remote watermark,
+// last_remote_persisted_seq == last_durable_seq, only advances AFTER write_sst
+// returns Ok and WalFlushed fires — wal_buffer.rs:326/335-338, db.rs:2070). Then
+// release the PUT, let flush complete, and re-read Remote: each MUST now hit.
+//
+// Emits one INFLIGHT line per key + an INFLIGHT_SUMMARY. put_was_blocked=true
+// asserts the fault actually armed (>=1 WAL PUT caught in-flight); a green with
+// put_was_blocked=false is vacuous and the python plane VOIDs it. Always exits 0.
+// ---------------------------------------------------------------------------
+
+async fn open_db_blocking_wal_put(root: &str) -> (Db, Arc<block_put::PutGate>) {
+    let local = LocalFileSystem::new_with_prefix(root)
+        .unwrap_or_else(|e| panic!("LocalFileSystem::new_with_prefix({root}): {e}"));
+    let base: Arc<dyn ObjectStore> = Arc::new(local);
+    let gate = block_put::PutGate::new();
+    let store: Arc<dyn ObjectStore> = Arc::new(block_put::BlockWalPut::new(base, gate.clone()));
+    // flush_interval=None: an await_durable=false write is NEVER auto-flushed to
+    // object storage until we explicitly db.flush() — so the ONLY WAL PUT is the
+    // one we deliberately block, and the in-flight window is deterministic.
+    let settings = Settings {
+        flush_interval: None,
+        ..Default::default()
+    };
+    let db = Db::builder(OsPath::from(root), store)
+        .with_settings(settings)
+        .build()
+        .await
+        .unwrap_or_else(|e| panic!("Db::builder({root}).with_settings(..).build(): {e}"));
+    (db, gate)
+}
+
+async fn cmd_inflight_probe(args: &[String]) {
+    let root = require(args, "--root");
+    let seed: u64 = require(args, "--seed").parse().expect("--seed u64");
+    let keys: u64 = flag(args, "--keys")
+        .map(|s| s.parse().expect("--keys u64"))
+        .unwrap_or(8);
+
+    let (db, gate) = open_db_blocking_wal_put(&root).await;
+
+    let put_opts = PutOptions::default();
+    let write_dirty = WriteOptions {
+        await_durable: false,
+        ..Default::default()
+    };
+    let read_remote = ReadOptions {
+        durability_filter: DurabilityLevel::Remote,
+        ..Default::default()
+    };
+
+    // Deterministic (key,value) stream — same generator as durprobe.
+    let mut rng = XorShift64::new(seed);
+    let kvs: Vec<(String, String)> = (0..keys).map(|seq| op_kv(&mut rng, seq)).collect();
+
+    // 1. Write every key await_durable=false — lands in the WAL buffer, NOT durable.
+    for (key, value) in &kvs {
+        db.put_with_options(key.as_bytes(), value.as_bytes(), &put_opts, &write_dirty)
+            .await
+            .unwrap_or_else(|e| panic!("put {key}: {e}"));
+    }
+
+    // 2. Arm the WAL-PUT block, then trigger the flush on a background task. Its
+    //    WAL SST PUT enters the wrapper and blocks in-flight.
+    gate.arm();
+    let db_flush = db.clone();
+    let flush_handle = tokio::spawn(async move { db_flush.flush().await });
+
+    // 3. Wait until the WAL PUT is actually blocked in-flight (fault armed).
+    let put_was_blocked = gate
+        .wait_entered(std::time::Duration::from_secs(10))
+        .await;
+
+    // 4. WHILE the PUT is blocked, Remote MUST exclude every key (value not yet
+    //    durably persisted — a crash now loses it).
+    let mut during_block: Vec<bool> = Vec::with_capacity(kvs.len());
+    let mut during_block_hits: u64 = 0;
+    for (key, value) in &kvs {
+        let got = db
+            .get_with_options(key.as_bytes(), &read_remote)
+            .await
+            .unwrap_or_else(|e| panic!("get(remote,during-block) {key}: {e}"));
+        // If the fault never armed, put_was_blocked=false and these reads are not
+        // a real in-flight observation; the python plane VOIDs that case. We still
+        // record what Remote returned for transparency.
+        let h = put_was_blocked && hit(&got, value);
+        if h {
+            during_block_hits += 1;
+        }
+        during_block.push(h);
+    }
+
+    // 5. Release the PUT and let the flush complete durably.
+    gate.release();
+    let flush_res = flush_handle.await.expect("flush task join");
+    flush_res.unwrap_or_else(|e| panic!("db.flush(): {e}"));
+
+    // 6. After release, Remote MUST now return every key (WAL object landed, the
+    //    watermark advanced past the batch).
+    let mut after_release: Vec<bool> = Vec::with_capacity(kvs.len());
+    let mut after_release_hits: u64 = 0;
+    for (key, value) in &kvs {
+        let got = db
+            .get_with_options(key.as_bytes(), &read_remote)
+            .await
+            .unwrap_or_else(|e| panic!("get(remote,after-release) {key}: {e}"));
+        let h = hit(&got, value);
+        if h {
+            after_release_hits += 1;
+        }
+        after_release.push(h);
+    }
+
+    db.close().await.expect("db.close");
+
+    for (i, (key, _value)) in kvs.iter().enumerate() {
+        println!(
+            "INFLIGHT key={key} remote_during_block={} remote_after_release={}",
+            hitstr(during_block[i]),
+            hitstr(after_release[i]),
+        );
+    }
+    println!(
+        "INFLIGHT_SUMMARY keys={} during_block_hits={during_block_hits} \
+         after_release_hits={after_release_hits} put_was_blocked={put_was_blocked}",
+        kvs.len(),
+    );
+}
+
 #[tokio::main]
 async fn main() {
     let argv: Vec<String> = std::env::args().collect();
@@ -590,14 +730,16 @@ async fn main() {
         "durprobe" => cmd_durprobe(rest).await,
         "remote-run" => cmd_remote_run(rest).await,
         "verify-remote" => cmd_verify_remote(rest).await,
+        "inflight-probe" => cmd_inflight_probe(rest).await,
         "-h" | "--help" => {
             println!(
-                "slatedb-driver <run|verify|durprobe|remote-run|verify-remote>\n\
-                 run           --root <dir> --ack-log <path> --seed <u64> --ops <n> [--head-false-negative <wal_id>]\n\
-                 verify        --root <dir> --ack-log <path> [--head-false-negative <wal_id>]\n\
-                 durprobe      --root <dir> --seed <u64> [--keys <n>]\n\
-                 remote-run    --root <dir> --remote-log <path> --seed <u64> --ops <n> [--durable-every <n>]\n\
-                 verify-remote --root <dir> --remote-log <path>"
+                "slatedb-driver <run|verify|durprobe|remote-run|verify-remote|inflight-probe>\n\
+                 run            --root <dir> --ack-log <path> --seed <u64> --ops <n> [--head-false-negative <wal_id>]\n\
+                 verify         --root <dir> --ack-log <path> [--head-false-negative <wal_id>]\n\
+                 durprobe       --root <dir> --seed <u64> [--keys <n>]\n\
+                 remote-run     --root <dir> --remote-log <path> --seed <u64> --ops <n> [--durable-every <n>]\n\
+                 verify-remote  --root <dir> --remote-log <path>\n\
+                 inflight-probe --root <dir> --seed <u64> [--keys <n>]"
             );
         }
         other => {

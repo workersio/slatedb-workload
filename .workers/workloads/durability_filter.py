@@ -514,8 +514,138 @@ def case_crash_confirm(seed: int) -> int:
 # ---------------------------------------------------------------------------
 
 
+def parse_inflight(stdout: str):
+    """Return (per_key, summary).
+
+    per_key: list of {key, remote_during_block, remote_after_release} bools.
+    summary: dict from INFLIGHT_SUMMARY, or None.
+    """
+    per_key = []
+    summary = None
+    for line in stdout.splitlines():
+        line = line.strip()
+        if line.startswith("INFLIGHT_SUMMARY "):
+            summary = {}
+            for tok in line.split()[1:]:
+                k, _, v = tok.partition("=")
+                summary[k] = v
+        elif line.startswith("INFLIGHT "):
+            rec = {}
+            for tok in line.split()[1:]:
+                k, _, v = tok.partition("=")
+                rec[k] = v
+            per_key.append({
+                "key": rec.get("key", ""),
+                "remote_during_block": rec.get("remote_during_block") == "hit",
+                "remote_after_release": rec.get("remote_after_release") == "hit",
+            })
+    return per_key, summary
+
+
 def case_inflight_flush(seed: int) -> int:
-    raise NotImplementedError("executor fills next episode")
+    """Remote excludes an in-flight (not-yet-durable) value at the flush boundary.
+
+    The driver holds the WAL SST PUT in-flight (blocked) while it issues
+    `get_with_options(.., Remote)` for every key. At that instant the value lives
+    in the WAL buffer but its WAL object is NOT yet persisted — a crash would lose
+    it — so Remote MUST return None (during_block_hits == 0). A Remote hit here is
+    a wrong-durable-read (weight 3). After the PUT is released Remote MUST return
+    every value (after_release_hits == keys).
+
+    Anti-vacuity: the fault must actually arm — put_was_blocked=true and >=1 key —
+    else the in-flight window was never observed and a green is theater (VOID).
+    """
+    selftest = crashclock.selftest_active()
+
+    root = tempfile.mkdtemp(prefix="slatedb-durfilter-root-")
+
+    emit(f"CASE inflight-flush seed={seed} keys={KEYS} root={root}")
+    emit("CLOCK inflight-flush armed kind=wal_put_block axis=flush_boundary "
+         f"(WAL SST PUT held in-flight while Remote is probed) seed={seed}")
+
+    probe = run_driver(
+        ["inflight-probe", "--root", root, "--seed", str(seed), "--keys", str(KEYS)]
+    )
+    sys.stdout.write(probe.stdout)
+    sys.stdout.flush()
+    if probe.returncode != 0:
+        emit(f"DRIVER inflight-probe failed rc={probe.returncode}\n{probe.stderr}")
+        disarm_liveness(False, "driver inflight-probe crashed")
+        invariant("durability_filter_remote_excludes_inflight",
+                  "remote-excludes-mid-flight-put", False,
+                  "driver inflight-probe did not complete")
+        emit("VERDICT: RED — driver inflight-probe crashed")
+        return 1
+
+    per_key, summary = parse_inflight(probe.stdout)
+
+    # --- terminal-state sweep: a verdict for every key -----------------------
+    n_keys = len(per_key)
+    terminal_ok = summary is not None and n_keys == KEYS and \
+        int(summary.get("keys", "-1")) == KEYS
+    invariant(
+        "terminal_state", "inflight-keys-resolved", terminal_ok,
+        f"inflight-probe emitted a verdict for {n_keys}/{KEYS} keys (summary={summary})"
+        if terminal_ok else
+        f"driver exited without a full verdict (per_key={n_keys} expected={KEYS} "
+        f"summary={summary})",
+    )
+
+    # --- fault-arm / anti-vacuity: the WAL PUT must actually have been blocked --
+    put_was_blocked = summary is not None and summary.get("put_was_blocked") == "true"
+
+    during_block_hits = sum(1 for r in per_key if r["remote_during_block"])
+    after_release_hits = sum(1 for r in per_key if r["remote_after_release"])
+
+    # --- ORACLE_SELFTEST: force a Remote hit during the in-flight window -------
+    # A real violation (Remote surfacing a value whose WAL PUT has not landed)
+    # looks EXACTLY like this — the falsifiable core must go FAIL.
+    if selftest and per_key:
+        during_block_hits += 1
+        emit("ORACLE_SELFTEST: injected fake remote_during_block hit "
+             "(durability_filter_remote_excludes_inflight must go FAIL)")
+
+    # --- anti-vacuity floor: fault must have armed on >=1 key -----------------
+    if not put_was_blocked or KEYS < 1:
+        disarm_liveness(True, "fault did not arm (WAL PUT not blocked)")
+        reason = (f"put_was_blocked={put_was_blocked} keys={KEYS} — the WAL SST PUT "
+                  f"was never held in-flight, so the flush-boundary window was not "
+                  f"observed; cannot assert Remote exclusion. seed={seed}")
+        emit(f"VERDICT: VOID — {reason}")
+        return 3
+
+    # --- INVARIANT durability_filter_remote_excludes_inflight (FALSIFIABLE CORE)
+    # NO value whose WAL PUT is still in-flight may be visible to a Remote read.
+    excl_ok = terminal_ok and during_block_hits == 0
+    invariant(
+        "durability_filter_remote_excludes_inflight", "remote-excludes-mid-flight-put",
+        excl_ok,
+        f"during_block_hits={during_block_hits} (MUST be 0) put_was_blocked={put_was_blocked}",
+    )
+
+    # --- INVARIANT durability_filter_remote_after_release --------------------
+    # Once the WAL PUT lands, Remote MUST return every value.
+    after_ok = terminal_ok and after_release_hits == KEYS
+    invariant(
+        "durability_filter_remote_after_release", "remote-sees-after-release", after_ok,
+        f"after_release_hits={after_release_hits}/{KEYS}",
+    )
+
+    all_ok = terminal_ok and excl_ok and after_ok
+    summary_line = (f"during_block_hits={during_block_hits} after_release_hits={after_release_hits} "
+                    f"put_was_blocked={put_was_blocked} keys={KEYS} seed={seed}")
+
+    if not all_ok:
+        disarm_liveness(True, "verdict reached (inflight oracle FAIL)")
+        emit(f"VERDICT: RED — Remote surfaced a value whose WAL PUT had not completed "
+             f"(wrong-durable-read): {summary_line}")
+        emit(f"REPLAY red: SEED={seed} case=inflight-flush keys={KEYS}")
+        return 1
+
+    disarm_liveness(True, "verdict reached (inflight oracle PASS)")
+    emit(f"VERDICT: GREEN — Remote excluded the in-flight value at the flush boundary: "
+         f"{summary_line}")
+    return 0
 
 
 # ---------------------------------------------------------------------------
