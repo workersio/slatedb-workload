@@ -52,14 +52,14 @@ explorations:
       value whose WAL object is not yet persisted, a crash at that instant loses
       it — falsification (wrong-durable-read). Arms the flush at seed-swept
       crashclock points against the ack/durable_seq gate (wal_buffer.rs:334-338).
-    status: ready
-    result: null
+    status: done
+    result: green
     reason: null
     workload: workloads/durability_filter.py
     command: python3 .workers/workloads/durability_filter.py --case inflight-flush
     faults: [process-kill]
     depth: 20
-    replay: null
+    replay: {run: "nd7962sqbfhq5mdg34z29garas8a9qab", case: inflight-flush, seed: 5}
     freshness: new-current
     reported: null
     published: null
