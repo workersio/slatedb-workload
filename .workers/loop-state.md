@@ -7,7 +7,7 @@
 - last-scanned-sha: 016b676ee125f02cb14054cce0cd5a78f3524ac5
 - target-head-sha: 016b676ee125f02cb14054cce0cd5a78f3524ac5
 - re-plan triggers: none
-- publish-pending: []   # all 3 durable-ack officials live (baseline nd7db1rk, crash-mid-flush nd72ajfy, wal-head-contiguity nd7epmpg)
+- publish-pending: [durability-filter-remote-inflight-flush]   # transient convex OCC; 5 officials live, re-fire publish.py for this last one
 - last episode summary: |
     Executor #6 (durability-filter-remote-inflight-flush) — GREEN. BlockWalPut
     wrapper holds the WAL SST PUT in-flight; Remote excludes the value until the

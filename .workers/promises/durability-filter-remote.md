@@ -62,7 +62,7 @@ explorations:
     replay: {run: "nd7962sqbfhq5mdg34z29garas8a9qab", case: inflight-flush, seed: 5}
     freshness: new-current
     reported: null
-    published: null
+    published: pending
 ---
 # A Remote-durability read never shows a value a crash would lose
 
