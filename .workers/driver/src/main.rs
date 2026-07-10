@@ -65,6 +65,31 @@ fn op_kv(rng: &mut XorShift64, seq: u64) -> (String, String) {
     (key, value)
 }
 
+/// The (key, value) for op `seq` in the fencing OVERLAP-WRITES case. Two
+/// deliberate differences from `op_kv`:
+///   * `key_space > 0` maps the op onto a small CYCLED keyspace (`k{seq%N}`) so
+///     the victim's post-fence attempts land on the SAME keys the usurper writes
+///     — real contention, not disjoint keys.
+///   * a non-empty `tag` prefixes the writer identity into the value
+///     (`{tag}:{seq}:{key}:{noise}`), so on final reopen we can attribute every
+///     durable value to the writer that produced it (A = victim, B = usurper) and
+///     to its exact local seq. Values stay tab-free (verify splits on '\t') and
+///     unique per write (seq+noise), so an exact string match is unambiguous.
+///
+/// RNG consumption is identical to `op_kv` (one `next_u64` per call), so the
+/// seeded stream is deterministic regardless of tag/key_space.
+fn fence_kv(rng: &mut XorShift64, seq: u64, tag: &str, key_space: u64) -> (String, String) {
+    let kid = if key_space > 0 { seq % key_space } else { seq };
+    let key = format!("k{kid}");
+    let noise = rng.next_u64();
+    let value = if tag.is_empty() {
+        format!("s{seq}:{key}:{noise:016x}")
+    } else {
+        format!("{tag}:{seq}:{key}:{noise:016x}")
+    };
+    (key, value)
+}
+
 // ---------------------------------------------------------------------------
 // Tiny hand-rolled arg parsing (keep deps minimal for musl).
 // ---------------------------------------------------------------------------
@@ -740,15 +765,30 @@ async fn cmd_inflight_probe(args: &[String]) {
 // verdict.
 // ---------------------------------------------------------------------------
 
-async fn open_db_fence(root: &str) -> Db {
+async fn open_db_fence(root: &str, flush_ms: Option<u64>) -> Db {
     let store = build_object_store(root, None);
     // Small manifest_poll_interval so the incumbent writer's background poller
     // observes the usurper's epoch bump promptly (default is 1s; config.rs:981).
     // The fenced write also surfaces at the next await_durable flush regardless.
-    let settings = Settings {
+    //
+    // flush_ms overrides flush_interval when set. This matters ONLY for the
+    // overlap-writes victim: the DEFAULT flush_interval is 100ms (config.rs:978),
+    // so every await_durable=true put blocks ~100ms for the next flush tick — the
+    // incumbent commits only ~10 writes/s, far too slow to ever have a write in
+    // flight when the usurper opens (the fence barrier lands in the 100ms gap and
+    // the next put collides → the post-fence window never opens, the case is
+    // perpetually VOID). A small flush_interval makes the victim's durable acks
+    // fast (~ms), so a genuine await_durable=true put resolves `ok` inside the
+    // post-open window — the very race the baseline observed in-guest. This is a
+    // realistic production setting and does NOT weaken the oracle: every recorded
+    // ack is still a true await_durable=true durable commit.
+    let mut settings = Settings {
         manifest_poll_interval: std::time::Duration::from_millis(100),
         ..Default::default()
     };
+    if let Some(ms) = flush_ms {
+        settings.flush_interval = Some(std::time::Duration::from_millis(ms));
+    }
     Db::builder(OsPath::from(root), store)
         .with_settings(settings)
         .build()
@@ -759,6 +799,29 @@ async fn open_db_fence(root: &str) -> Db {
 /// Append one crash-safe fsync'd `seq\tkey\tvalue` ack line (same rule as `run`).
 fn append_ack(log: &mut File, seq: u64, key: &str, value: &str) {
     writeln!(log, "{seq}\t{key}\t{value}").expect("write ack-log");
+    log.flush().expect("flush ack-log");
+    log.sync_all().expect("fsync ack-log");
+}
+
+/// Wall-clock nanoseconds since the unix epoch. Wall (not `Instant`) because the
+/// overlap-writes oracle compares timestamps ACROSS the victim and usurper
+/// PROCESSES on one host — `Instant` epochs differ per process; the wall clock is
+/// the only cross-process-comparable timebase. Single host, ms-scale spacing, so
+/// clock granularity is irrelevant.
+fn wall_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+/// Overlap-writes ack line: `seq\tkey\tvalue\tack_nanos`. The 4th field is the
+/// wall-clock instant the put resolved durably `ok` — the ONLY thing that lets
+/// the oracle partition a victim ack into pre- vs post-usurper-open (vs the
+/// usurper's fsync'd open-marker nanos), independent of any python poll latency.
+/// Only emitted in tagged (overlap) mode; baseline stays 3-field for `verify`.
+fn append_ack_ts(log: &mut File, seq: u64, key: &str, value: &str, ts_nanos: u128) {
+    writeln!(log, "{seq}\t{key}\t{value}\t{ts_nanos}").expect("write ack-log");
     log.flush().expect("flush ack-log");
     log.sync_all().expect("fsync ack-log");
 }
@@ -790,6 +853,26 @@ async fn cmd_fence_victim(args: &[String]) {
     let prelude: u64 = flag(args, "--prelude-keys")
         .map(|s| s.parse().expect("--prelude-keys u64"))
         .unwrap_or(1);
+    // Overlap-writes knobs (baseline leaves both unset → old behavior):
+    //   --tag <A>          identity prefix in each value (empty = old s{seq} form).
+    //   --key-space <N>    cycle keys over k0..k{N-1} so post-fence attempts hit
+    //                      the SAME keys the usurper writes (0 = unique k{seq}).
+    let tag = flag(args, "--tag").unwrap_or("").to_string();
+    let key_space: u64 = flag(args, "--key-space")
+        .map(|s| s.parse().expect("--key-space u64"))
+        .unwrap_or(0);
+    // Inter-attempt sleep. Baseline default 100ms (spaces attempts so the usurper
+    // has time to open). Overlap-writes drives this SMALL so the victim almost
+    // always has a write in flight when the usurper opens — that in-flight write
+    // resolves `ok` AFTER the epoch bump (the post-fence write we hunt), then its
+    // successor collides with the fence barrier and is Fenced.
+    let attempt_sleep_ms: u64 = flag(args, "--attempt-sleep-ms")
+        .map(|s| s.parse().expect("--attempt-sleep-ms u64"))
+        .unwrap_or(100);
+    // Override flush_interval so durable acks are fast enough to land in the
+    // post-open race window (see open_db_fence). None = keep the 100ms default.
+    let flush_ms: Option<u64> =
+        flag(args, "--flush-ms").map(|s| s.parse().expect("--flush-ms u64"));
 
     let mut log = OpenOptions::new()
         .create(true)
@@ -797,7 +880,7 @@ async fn cmd_fence_victim(args: &[String]) {
         .open(&ack_log)
         .unwrap_or_else(|e| panic!("open ack-log {ack_log}: {e}"));
 
-    let db = open_db_fence(&root).await;
+    let db = open_db_fence(&root, flush_ms).await;
 
     let put_opts = PutOptions::default();
     let write_opts = WriteOptions {
@@ -809,11 +892,15 @@ async fn cmd_fence_victim(args: &[String]) {
 
     // --- prelude: ack a few keys as the live writer (no fence yet) ------------
     for seq in 0..prelude {
-        let (key, value) = op_kv(&mut rng, seq);
+        let (key, value) = fence_kv(&mut rng, seq, &tag, key_space);
         db.put_with_options(key.as_bytes(), value.as_bytes(), &put_opts, &write_opts)
             .await
             .unwrap_or_else(|e| panic!("victim prelude put seq={seq}: {e}"));
-        append_ack(&mut log, seq, &key, &value);
+        if tag.is_empty() {
+            append_ack(&mut log, seq, &key, &value);
+        } else {
+            append_ack_ts(&mut log, seq, &key, &value, wall_nanos());
+        }
     }
     println!("VICTIM prelude_acked={prelude}");
 
@@ -824,7 +911,7 @@ async fn cmd_fence_victim(args: &[String]) {
     let mut ok_count: u64 = 0;
     for i in 0..attempts {
         let seq = prelude + i;
-        let (key, value) = op_kv(&mut rng, seq);
+        let (key, value) = fence_kv(&mut rng, seq, &tag, key_space);
         let result = db
             .put_with_options(key.as_bytes(), value.as_bytes(), &put_opts, &write_opts)
             .await;
@@ -836,12 +923,19 @@ async fn cmd_fence_victim(args: &[String]) {
         }
         if class == "ok" {
             ok_count += 1;
-            // A post-fence `ok` is durably-visible zombie data — record it so the
-            // python can verify it against the winner's history.
-            append_ack(&mut log, seq, &key, &value);
+            // A post-fence `ok` is durably-visible zombie data — record it (with
+            // the resolve instant in overlap mode) so the python can partition it
+            // against the usurper's open and check it against the winner's history.
+            if tag.is_empty() {
+                append_ack(&mut log, seq, &key, &value);
+            } else {
+                append_ack_ts(&mut log, seq, &key, &value, wall_nanos());
+            }
         }
         // Space attempts so the usurper has time to open + fence.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if attempt_sleep_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(attempt_sleep_ms)).await;
+        }
     }
 
     println!("VICTIM done fenced={fenced} ok_after_prelude={ok_count} attempts={attempts}");
@@ -857,6 +951,19 @@ async fn cmd_fence_usurper(args: &[String]) {
     let keys: u64 = flag(args, "--keys")
         .map(|s| s.parse().expect("--keys u64"))
         .unwrap_or(5);
+    // Overlap-writes knobs (baseline leaves unset). --tag prefixes writer identity
+    // into values; --key-space cycles keys (0 = unique k{seq}, which for keys=N
+    // already yields exactly k0..k{N-1} — the contended keyspace).
+    let tag = flag(args, "--tag").unwrap_or("").to_string();
+    let key_space: u64 = flag(args, "--key-space")
+        .map(|s| s.parse().expect("--key-space u64"))
+        .unwrap_or(0);
+    // --open-marker <path>: a file the usurper fsync's IMMEDIATELY after open()
+    // returns (epoch already bumped), containing the wall-clock nanos of the open.
+    // The oracle reads this as t_open and classifies any victim ack with
+    // ack_nanos >= t_open as a POST-FENCE (superseded-writer) write. Written
+    // before any usurper ack so it strictly precedes the usurper's own writes.
+    let open_marker = flag(args, "--open-marker").map(|s| s.to_string());
 
     let mut log = OpenOptions::new()
         .create(true)
@@ -866,8 +973,20 @@ async fn cmd_fence_usurper(args: &[String]) {
 
     // Opening the SAME root bumps the manifest epoch and writes the WAL fence
     // barrier → the incumbent victim is fenced from this instant onward.
-    let db = open_db_fence(&root).await;
-    println!("USURPER opened root={root}");
+    let db = open_db_fence(&root, None).await;
+    let open_nanos = wall_nanos();
+    if let Some(ref marker) = open_marker {
+        let mut mf = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(marker)
+            .unwrap_or_else(|e| panic!("open open-marker {marker}: {e}"));
+        write!(mf, "{open_nanos}").expect("write open-marker");
+        mf.flush().expect("flush open-marker");
+        mf.sync_all().expect("fsync open-marker");
+    }
+    println!("USURPER opened root={root} open_nanos={open_nanos}");
 
     let put_opts = PutOptions::default();
     let write_opts = WriteOptions {
@@ -877,7 +996,7 @@ async fn cmd_fence_usurper(args: &[String]) {
 
     let mut rng = XorShift64::new(seed);
     for seq in 0..keys {
-        let (key, value) = op_kv(&mut rng, seq);
+        let (key, value) = fence_kv(&mut rng, seq, &tag, key_space);
         db.put_with_options(key.as_bytes(), value.as_bytes(), &put_opts, &write_opts)
             .await
             .unwrap_or_else(|e| panic!("usurper put seq={seq}: {e}"));
@@ -892,11 +1011,71 @@ async fn cmd_fence_usurper(args: &[String]) {
     println!("USURPER done keys={keys} ack_log={ack_log}");
 }
 
+// ---------------------------------------------------------------------------
+// dump — reopen the root (latest durable state) and print the value of every key
+// k0..k{keys-1}, one `DUMP key=<k> value=<v|__MISSING__>` line each. The
+// overlap-writes oracle reads this to attribute each contended key's final
+// durable value to its writer (A=victim/B=usurper) via the value tag, so it can
+// (1) flag a post-fence victim value that WON (zombie) and (2) flag a usurper key
+// overwritten/lost. Always exits 0 — the python owns the verdict.
+// ---------------------------------------------------------------------------
+
+async fn cmd_dump(args: &[String]) {
+    let root = require(args, "--root");
+    let keys: u64 = require(args, "--keys").parse().expect("--keys u64");
+
+    let db = match open_db_result(&root, None).await {
+        Ok(db) => db,
+        Err(e) => {
+            println!("DUMP_OPEN_FAILED err={e:?}");
+            return;
+        }
+    };
+    for kid in 0..keys {
+        let key = format!("k{kid}");
+        let val = match db.get(key.as_bytes()).await.expect("db.get") {
+            Some(b) => String::from_utf8_lossy(b.as_ref()).into_owned(),
+            None => "__MISSING__".to_string(),
+        };
+        println!("DUMP key={key} value={val}");
+    }
+    db.close().await.expect("db.close");
+    println!("DUMP_DONE keys={keys}");
+}
+
+// ---------------------------------------------------------------------------
+// put-kv — durably write ONE (key,value) with a fresh open (latest epoch).
+//
+// Only used by the overlap-writes ORACLE_SELFTEST: it plants a durable value at a
+// contended key so the oracle's zombie/lost-update detection MUST fire. Because
+// it opens fresh (newest epoch) and writes await_durable=true, the value is the
+// unconditional durable winner on the next reopen — exactly the "a fenced-writer
+// value became the durable winner" condition, injected deterministically.
+// ---------------------------------------------------------------------------
+
+async fn cmd_put_kv(args: &[String]) {
+    let root = require(args, "--root");
+    let key = require(args, "--key");
+    let value = require(args, "--value");
+
+    let db = open_db_fence(&root, None).await;
+    let put_opts = PutOptions::default();
+    let write_opts = WriteOptions {
+        await_durable: true,
+        ..Default::default()
+    };
+    db.put_with_options(key.as_bytes(), value.as_bytes(), &put_opts, &write_opts)
+        .await
+        .unwrap_or_else(|e| panic!("put-kv {key}: {e}"));
+    db.close().await.expect("db.close");
+    println!("PUT_KV ok key={key} value={value}");
+}
+
 #[tokio::main]
 async fn main() {
     let argv: Vec<String> = std::env::args().collect();
     if argv.len() < 2 {
-        eprintln!("usage: slatedb-driver <run|verify|durprobe|remote-run|verify-remote|inflight-probe|fence-victim|fence-usurper> [flags]");
+        eprintln!("usage: slatedb-driver <run|verify|durprobe|remote-run|verify-remote|inflight-probe|fence-victim|fence-usurper|put-kv> [flags]");
         std::process::exit(2);
     }
     let sub = argv[1].as_str();
@@ -910,6 +1089,8 @@ async fn main() {
         "inflight-probe" => cmd_inflight_probe(rest).await,
         "fence-victim" => cmd_fence_victim(rest).await,
         "fence-usurper" => cmd_fence_usurper(rest).await,
+        "put-kv" => cmd_put_kv(rest).await,
+        "dump" => cmd_dump(rest).await,
         "-h" | "--help" => {
             println!(
                 "slatedb-driver <run|verify|durprobe|remote-run|verify-remote|inflight-probe>\n\
@@ -919,8 +1100,10 @@ async fn main() {
                  remote-run     --root <dir> --remote-log <path> --seed <u64> --ops <n> [--durable-every <n>]\n\
                  verify-remote  --root <dir> --remote-log <path>\n\
                  inflight-probe --root <dir> --seed <u64> [--keys <n>]\n\
-                 fence-victim   --root <dir> --ack-log <path> --seed <u64> [--attempts <n>] [--prelude-keys <n>]\n\
-                 fence-usurper  --root <dir> --ack-log <path> --seed <u64> [--keys <n>]"
+                 fence-victim   --root <dir> --ack-log <path> --seed <u64> [--attempts <n>] [--prelude-keys <n>] [--tag <s>] [--key-space <n>] [--attempt-sleep-ms <n>]\n\
+                 fence-usurper  --root <dir> --ack-log <path> --seed <u64> [--keys <n>] [--tag <s>] [--key-space <n>] [--open-marker <path>]\n\
+                 put-kv         --root <dir> --key <k> --value <v>\n\
+                 dump           --root <dir> --keys <n>"
             );
         }
         other => {
