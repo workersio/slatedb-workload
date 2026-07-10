@@ -1,22 +1,29 @@
 # Loop state
 - rails: { loops: 100, workloads: 250 }   # defaults — safety rails, not targets
-- counters: { episodes: 2, producer: 1, executor: 1, workloads: 1 }
+- counters: { episodes: 4, producer: 1, executor: 2, workloads: 2 }
 - no-new-info: { streak: 0, K: 5 }
 - in-flight unit: none
-- re-entry: durable-ack-baseline → deepen — baseline green proves driver+oracle; next rung crash-mid-flush is the real bug hunt (SIGKILL mid-flush), already ready. No L change (first-rung green, weak evidence).
+- re-entry: durable-ack-crash-mid-flush → deepen — green (SlateDB recovers acked writes from mid-flush kill); next rung wal-head-contiguity is the genuine-bug candidate AND the ladder-floor completer. No L change (2 greens on distinct harnesses, not same-corridor supersets).
 - last-scanned-sha: 016b676ee125f02cb14054cce0cd5a78f3524ac5
 - target-head-sha: 016b676ee125f02cb14054cce0cd5a78f3524ac5
 - re-plan triggers: none
 - publish-pending: []
 - last episode summary: |
-    Executor #1 (durable-ack-baseline) — the driver-bootstrap unit. Built the
-    bespoke slatedb-driver (musl static-pie, default-features=false, first-try),
-    vendored + build.sh. durable_ack.py baseline with the universal oracle plane.
-    In-guest: baseline GREEN (exploration nd79nxsh, 3/3 succeeded) and
-    ORACLE_SELFTEST RED (run 01KX5YB5…, appears in --violations) — step-5
-    red-proof gate satisfied. test-reviewer: KEEP. Published official
-    durable-ack-baseline (nd773r0v…, depth 10, green replay-confirmation).
-    Playbook written (runs/executor-notes.md): verdict-reading (workloads ls is
-    account-wide; failed+INVARIANT-FAIL still counts as violation), official-run
-    flow, driver rebuild. Next dispatcher row: 3 (re-entry pending
-    durable-ack-baseline) → producer inline re-entry decision.
+    Executor #2 (durable-ack-crash-mid-flush) — GREEN. SIGKILL after the
+    seed-derived K-th fsync'd ack (ack-progress trigger, portable: the sim is
+    ~0.56s/ack vs box ~0.1s, so wall-clock windows VOID — keyed on SUT progress
+    instead). All acked writes recovered across the seed sweep; durawatch clean.
+    Published officials for baseline + crash-mid-flush (idempotent; one publish
+    hit a transient convex 503 OCC, retried).
+
+    RESUME POINTER (fresh session): dispatcher row 5 → executor on
+    **durable-ack-wal-head-contiguity** (status: ready) — the genuine-bug rung.
+    It attacks the reopen frontier's HEAD-monotonicity assumption
+    (tablestore.rs:177-179): install the driver's --head-false-negative wrapper
+    (already built, head_fn.rs, overrides get_opts on options.head for one
+    .../wal/{id:020}.sst) on the VERIFY/reopen open, sweep the target wal_id, and
+    check A ⊆ R — a false-negative HEAD that truncates replay is a data-loss RED.
+    Then producer re-entry, then the standing backlog (top: clone-consistency 400,
+    compacted-gc-vs-reader 400 — both need Admin/clone + GC-loop wiring in the
+    driver). Driver rebuild recipe + verdict-reading gotchas in
+    runs/executor-notes.md. Nothing in flight; all state committed.
