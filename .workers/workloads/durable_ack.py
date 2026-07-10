@@ -27,6 +27,7 @@ verify reports LOST → durable_ack_subset MUST go FAIL (proves the red path).
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -48,6 +49,18 @@ DRIVER = _REPO_ROOT / ".workers" / "vendor" / "bin" / "slatedb-driver"
 
 OPS = int(os.environ.get("SLATEDB_ACK_OPS", "24"))
 LIVENESS_DEADLINE_S = float(os.environ.get("SLATEDB_LIVENESS_S", "120"))
+
+# crash-mid-flush tunables.
+# REALITY (measured on-box): each await_durable=true put blocks ~100ms — the put
+# future resolves only on the next 100ms flush tick — so the driver `run` streams
+# at ~100ms/op with NO pacing flag needed; a large --ops naturally spans many
+# seconds and the SIGKILL always lands mid-run (we kill well before completion).
+CRASH_OPS = int(os.environ.get("SLATEDB_CRASH_OPS", "2000"))
+# The seed-swept kill lands T ms after the run starts, T log-uniform over
+# [floor, window] (crashclock LatencyWindowSpace) — different seeds kill at
+# different flush offsets. window kept < CRASH_OPS*~100ms so run never finishes.
+CRASH_WINDOW_MS = float(os.environ.get("SLATEDB_CRASH_WINDOW_MS", "6000"))
+CRASH_FLOOR_MS = float(os.environ.get("SLATEDB_CRASH_FLOOR_MS", "300"))
 
 
 def emit(msg: str) -> None:
@@ -244,6 +257,174 @@ def case_baseline(seed: int) -> int:
 
 
 # ---------------------------------------------------------------------------
+# durawatch delay-ladder re-observation (shared by baseline + crash cases)
+# ---------------------------------------------------------------------------
+
+
+def run_durawatch_ladder(case_name: str, root: str, ack_log: str, acked) -> None:
+    """Manifest the acked set and re-observe it across reopen on a delay ladder.
+
+    observe() re-reads by reopening the DB (`verify`) at each rung, so a *delayed*
+    erasure (GC/compaction after the acked write became readable) surfaces as a
+    later-rung miss. Emits durability_watch_* invariants and the final VERDICT.
+    """
+    ladder = (0.0, 2.0)
+    m = durawatch.Manifest.start(
+        case=case_name,
+        path=durawatch.manifest_path(case_name),
+        ladder=ladder,
+        void_floor=1,
+    )
+    for _seq, key, value in acked:
+        m.record(eid=key, query=key, payload=value)
+
+    cache = {"ts": 0.0, "bad": set(), "loaded": False}
+
+    def refresh() -> None:
+        v = run_driver(["verify", "--root", root, "--ack-log", ack_log])
+        _seen, _ok, _chk, _lost, _mm, bad = parse_verify(v.stdout)
+        cache["bad"] = bad
+        cache["ts"] = time.time()
+        cache["loaded"] = True
+
+    recorded = {key: value for _s, key, value in acked}
+
+    def observe(eff):
+        if not cache["loaded"] or (time.time() - cache["ts"]) > 0.5:
+            refresh()
+        if eff.query in cache["bad"]:
+            return None
+        return recorded.get(eff.query)
+
+    m.run_ladder(observe)
+
+
+# ---------------------------------------------------------------------------
+# crash-mid-flush case
+# ---------------------------------------------------------------------------
+
+
+def case_crash_mid_flush(seed: int) -> int:
+    selftest = durawatch.selftest_active()
+
+    # ack-log lives OUTSIDE the db root (a fault wrapper / crash must never corrupt it).
+    root = tempfile.mkdtemp(prefix="slatedb-ack-root-")
+    ack_fd, ack_log = tempfile.mkstemp(prefix="slatedb-ack-", suffix=".log")
+    os.close(ack_fd)
+    os.unlink(ack_log)  # let the driver create it fresh (append semantics)
+
+    # --- declared fault timing: derive the SIGKILL point from the seed --------
+    # LatencyWindowSpace: kill T ms after the run starts, T log-uniform over the
+    # flush arm so seeds straddle flush boundaries. Same seed => same T (replayable).
+    space = crashclock.latency_window(
+        "crash_mid_flush", window_ms=CRASH_WINDOW_MS, floor_ms=CRASH_FLOOR_MS
+    )
+    point = crashclock.offsets(seed, space)
+    kill_at_s = float(point["T_ms"]) / 1000.0
+
+    emit(f"CASE crash-mid-flush seed={seed} ops={CRASH_OPS} root={root} ack_log={ack_log}")
+    crashclock.clock_armed("crash-mid-flush", point)  # emits the CLOCK triage line
+    emit(f"KILL armed offset T_ms={point['T_ms']:.3f} (kill_at={kill_at_s:.3f}s) "
+         f"window_ms={CRASH_WINDOW_MS:g} seed={seed}")
+
+    # --- spawn the acked put stream in its own process group ------------------
+    # start_new_session=True → child is the pgid leader; we SIGKILL the whole group
+    # so no orphaned tokio worker survives. NO graceful cleanup: SIGKILL is abrupt.
+    proc = subprocess.Popen(
+        [str(DRIVER), "run", "--root", root, "--ack-log", ack_log,
+         "--seed", str(seed), "--ops", str(CRASH_OPS)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    t_start = time.time()
+    remaining = kill_at_s - (time.time() - t_start)
+    if remaining > 0:
+        time.sleep(remaining)
+
+    kill_mode = "already_dead"
+    if proc.poll() is None:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        kill_mode = "sigkill(pg)"
+    proc.wait()
+    killed_rc = proc.returncode
+    kill_wall = time.time() - t_start
+
+    # A T_ms=0 (zero-corner) kill can fire before the driver even creates the
+    # ack-log — that is the "too early" VOID case, not a crash of this harness.
+    acked = read_acked(ack_log) if os.path.exists(ack_log) else []
+    n_pre = len(acked)
+    emit(f"KILLED mode={kill_mode} rc={killed_rc} acked_before_kill={n_pre} "
+         f"kill_wall={kill_wall:.3f}s ops={CRASH_OPS}")
+
+    # --- anti-vacuity floors: the kill must land MID-RUN with acks recorded ---
+    # rc==0 means the run streamed all CRASH_OPS and exited cleanly before the
+    # kill fired — the SIGKILL never landed mid-flush, so a green would be theater.
+    if killed_rc == 0:
+        disarm_liveness(True, "kill missed window (run completed)")
+        emit(f"VERDICT: VOID — SIGKILL landed after run completed (all {CRASH_OPS} "
+             f"ops acked); raise SLATEDB_CRASH_OPS or shrink window. "
+             f"seed={seed} T_ms={point['T_ms']:.3f}")
+        return 3
+    if n_pre < 1:
+        disarm_liveness(True, "kill too early — no acked writes")
+        emit(f"VERDICT: VOID — no acked writes before the kill (fired too early); "
+             f"seed={seed} T_ms={point['T_ms']:.3f}")
+        return 3
+
+    # --- ORACLE_SELFTEST: plant a fake acked key the DB never wrote -----------
+    # Proves the crash-case A ⊆ R oracle's RED path: verify must report this key
+    # LOST → durable_ack_subset FAIL, before any crash-case green is trusted.
+    if selftest:
+        with open(ack_log, "a") as f:
+            f.write("999999\tSELFTEST_MISSING\tselftest-injected\n")
+            f.flush()
+            os.fsync(f.fileno())
+        emit("ORACLE_SELFTEST: injected fake acked line key=SELFTEST_MISSING "
+             "(verify must report LOST → crash-case oracle must go RED)")
+        acked = read_acked(ack_log)
+
+    # --- verify: reopen the SIGKILLed root + assert A ⊆ R value-exact ---------
+    ver = run_driver(["verify", "--root", root, "--ack-log", ack_log])
+    verdict_seen, subset_ok, checked, lost, mismatch, bad_keys = parse_verify(ver.stdout)
+    sys.stdout.write(ver.stdout)
+    sys.stdout.flush()
+    if ver.returncode != 0 and not verdict_seen:
+        emit(f"DRIVER verify failed rc={ver.returncode}\n{ver.stderr}")
+
+    # --- terminal-state sweep -------------------------------------------------
+    n_acked = len(acked)
+    terminal_ok = verdict_seen and checked == n_acked
+    invariant(
+        "terminal_state", "acked-keys-resolved", terminal_ok,
+        f"verify emitted verdict for {checked}/{n_acked} acked keys after SIGKILL+reopen"
+        if terminal_ok else
+        f"driver exited without a full verdict (verdict_seen={verdict_seen} "
+        f"checked={checked} expected={n_acked})",
+    )
+
+    # --- durable_ack_subset: the bespoke A ⊆ R verdict ------------------------
+    subset_pass = terminal_ok and subset_ok and lost == 0 and mismatch == 0
+    summary = (f"checked={checked} lost={lost} mismatch={mismatch} "
+               f"bad={sorted(bad_keys)[:8]} seed={seed} kill_T_ms={point['T_ms']:.3f}")
+    invariant("durable_ack_subset", "acked-subset-readable", subset_pass, summary)
+
+    if not subset_pass:
+        disarm_liveness(True, "verdict reached (durable_ack_subset FAIL)")
+        emit(f"VERDICT: RED — acked writes not durable after SIGKILL+reopen: {summary}")
+        emit(f"REPLAY red: SEED={seed} case=crash-mid-flush kill_T_ms={point['T_ms']:.3f} "
+             f"acked_before_kill={n_pre}")
+        return 1
+
+    disarm_liveness(True, "verdict reached (durable_ack_subset PASS)")
+    # durawatch: re-observe the acked set across reopen on a delay ladder to catch
+    # delayed erasure (compaction/GC after the crash-recovered read became visible).
+    run_durawatch_ladder("durable_ack_crash_mid_flush", root, ack_log, acked)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # entry
 # ---------------------------------------------------------------------------
 
@@ -271,7 +452,7 @@ def main() -> int:
     if args.case == "baseline":
         return case_baseline(seed)
     if args.case == "crash-mid-flush":
-        raise NotImplementedError("executor fills next episode")
+        return case_crash_mid_flush(seed)
     if args.case == "wal-head-contiguity":
         raise NotImplementedError("executor fills next episode")
     raise NotImplementedError(f"unknown case {args.case!r}")
