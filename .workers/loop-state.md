@@ -1,0 +1,11 @@
+# Loop state
+- rails: { loops: 100, workloads: 250 }   # defaults — safety rails, not targets
+- counters: { episodes: 0, producer: 0, executor: 0, workloads: 0 }
+- no-new-info: { streak: 0, K: 5 }
+- in-flight unit: none
+- re-entry: none
+- last-scanned-sha: 016b676ee125f02cb14054cce0cd5a78f3524ac5
+- target-head-sha: 016b676ee125f02cb14054cce0cd5a78f3524ac5
+- re-plan triggers: none
+- publish-pending: []
+- last episode summary: (init) scaffold created; SUT driver undecided (embedded lib — needs bespoke driver binary, see map.md). Next: producer episode — cartographer scout fan-out over slatedb/ to map areas + promises, and pick the driver build path.
