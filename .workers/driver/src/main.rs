@@ -23,7 +23,7 @@ use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
 use slatedb::config::{DurabilityLevel, PutOptions, ReadOptions, Settings, WriteOptions};
 use slatedb::object_store::path::Path as OsPath;
-use slatedb::Db;
+use slatedb::{CloseReason, Db, ErrorKind};
 
 mod block_put;
 mod head_fn;
@@ -715,11 +715,188 @@ async fn cmd_inflight_probe(args: &[String]) {
     );
 }
 
+// ---------------------------------------------------------------------------
+// fence-victim / fence-usurper — two-process writer-fencing (promise:
+// writer-fencing-split-brain).
+//
+// SlateDB is single-writer per object-store path: opening a Db bumps a manifest
+// epoch via version-CAS (manifest/store.rs) and the WriterFencer writes a
+// zero-byte WAL barrier (fence.rs:105). A superseded (older-epoch) writer's next
+// await_durable write therefore fails — surfaced to the public API as
+// `Error::kind() == ErrorKind::Closed(CloseReason::Fenced)` (SlateDBError::Fenced
+// mapped at error.rs:618; asserted by the crate's own test_fence).
+//
+//   fence-victim  — open the Db, ack a prelude of keys (it is the live writer),
+//                   then LOOP attempting await_durable=true puts, printing
+//                   `FENCE_OBSERVED attempt=<i> result=<ok|fenced|other:<kind>>`
+//                   for each. Stops on the first `fenced` (the win) or after
+//                   --attempts. The error is CLASSIFIED, never unwrapped.
+//   fence-usurper — open the SAME root (this bumps the epoch and fences the
+//                   victim), ack its own keys, hold ~1s, close cleanly.
+//
+// Both open the same LocalFileSystem::new_with_prefix(root) + same Db path with a
+// small manifest_poll_interval (config.rs:647) so the victim's background poller
+// observes the usurper's epoch bump promptly. Always exit 0 — the python owns the
+// verdict.
+// ---------------------------------------------------------------------------
+
+async fn open_db_fence(root: &str) -> Db {
+    let store = build_object_store(root, None);
+    // Small manifest_poll_interval so the incumbent writer's background poller
+    // observes the usurper's epoch bump promptly (default is 1s; config.rs:981).
+    // The fenced write also surfaces at the next await_durable flush regardless.
+    let settings = Settings {
+        manifest_poll_interval: std::time::Duration::from_millis(100),
+        ..Default::default()
+    };
+    Db::builder(OsPath::from(root), store)
+        .with_settings(settings)
+        .build()
+        .await
+        .unwrap_or_else(|e| panic!("Db::builder({root}).with_settings(..).build(): {e}"))
+}
+
+/// Append one crash-safe fsync'd `seq\tkey\tvalue` ack line (same rule as `run`).
+fn append_ack(log: &mut File, seq: u64, key: &str, value: &str) {
+    writeln!(log, "{seq}\t{key}\t{value}").expect("write ack-log");
+    log.flush().expect("flush ack-log");
+    log.sync_all().expect("fsync ack-log");
+}
+
+/// Classify a put result into the machine-readable FENCE_OBSERVED token.
+/// Ok → "ok"; the real Fenced surface → "fenced"; anything else → "other:<kind>".
+/// Never swallows or panics on the error — the point is to report its kind.
+fn classify_put(result: &Result<slatedb::WriteHandle, slatedb::Error>) -> String {
+    match result {
+        Ok(_) => "ok".to_string(),
+        Err(e) => match e.kind() {
+            ErrorKind::Closed(CloseReason::Fenced) => "fenced".to_string(),
+            other => format!("other:{other:?}"),
+        },
+    }
+}
+
+async fn cmd_fence_victim(args: &[String]) {
+    let root = require(args, "--root");
+    let ack_log = require(args, "--ack-log");
+    let seed: u64 = require(args, "--seed").parse().expect("--seed u64");
+    let attempts: u64 = flag(args, "--attempts")
+        .map(|s| s.parse().expect("--attempts u64"))
+        .unwrap_or(40);
+    // Keys acked BEFORE the usurper opens: proves the victim is the live writer.
+    // Default 1 — the python spawns the usurper only AFTER it sees this ack land
+    // durably, so the fence can only fire in the classified attempt loop below,
+    // never mid-prelude (where it would panic). These MUST succeed.
+    let prelude: u64 = flag(args, "--prelude-keys")
+        .map(|s| s.parse().expect("--prelude-keys u64"))
+        .unwrap_or(1);
+
+    let mut log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&ack_log)
+        .unwrap_or_else(|e| panic!("open ack-log {ack_log}: {e}"));
+
+    let db = open_db_fence(&root).await;
+
+    let put_opts = PutOptions::default();
+    let write_opts = WriteOptions {
+        await_durable: true,
+        ..Default::default()
+    };
+
+    let mut rng = XorShift64::new(seed);
+
+    // --- prelude: ack a few keys as the live writer (no fence yet) ------------
+    for seq in 0..prelude {
+        let (key, value) = op_kv(&mut rng, seq);
+        db.put_with_options(key.as_bytes(), value.as_bytes(), &put_opts, &write_opts)
+            .await
+            .unwrap_or_else(|e| panic!("victim prelude put seq={seq}: {e}"));
+        append_ack(&mut log, seq, &key, &value);
+    }
+    println!("VICTIM prelude_acked={prelude}");
+
+    // --- attempt loop: the usurper opens concurrently; once it bumps the epoch
+    //     the victim's next await_durable flush MUST fail Fenced. If EVERY
+    //     attempt returns `ok`, the victim was never fenced — split-brain.
+    let mut fenced = false;
+    let mut ok_count: u64 = 0;
+    for i in 0..attempts {
+        let seq = prelude + i;
+        let (key, value) = op_kv(&mut rng, seq);
+        let result = db
+            .put_with_options(key.as_bytes(), value.as_bytes(), &put_opts, &write_opts)
+            .await;
+        let class = classify_put(&result);
+        println!("FENCE_OBSERVED attempt={i} seq={seq} result={class}");
+        if class == "fenced" {
+            fenced = true;
+            break;
+        }
+        if class == "ok" {
+            ok_count += 1;
+            // A post-fence `ok` is durably-visible zombie data — record it so the
+            // python can verify it against the winner's history.
+            append_ack(&mut log, seq, &key, &value);
+        }
+        // Space attempts so the usurper has time to open + fence.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    println!("VICTIM done fenced={fenced} ok_after_prelude={ok_count} attempts={attempts}");
+    // Do NOT db.close() on the fenced path — closing a fenced Db can itself error.
+    // The ack-log is already fsync'd; exit 0 and let the python own the verdict.
+    std::process::exit(0);
+}
+
+async fn cmd_fence_usurper(args: &[String]) {
+    let root = require(args, "--root");
+    let ack_log = require(args, "--ack-log");
+    let seed: u64 = require(args, "--seed").parse().expect("--seed u64");
+    let keys: u64 = flag(args, "--keys")
+        .map(|s| s.parse().expect("--keys u64"))
+        .unwrap_or(5);
+
+    let mut log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&ack_log)
+        .unwrap_or_else(|e| panic!("open ack-log {ack_log}: {e}"));
+
+    // Opening the SAME root bumps the manifest epoch and writes the WAL fence
+    // barrier → the incumbent victim is fenced from this instant onward.
+    let db = open_db_fence(&root).await;
+    println!("USURPER opened root={root}");
+
+    let put_opts = PutOptions::default();
+    let write_opts = WriteOptions {
+        await_durable: true,
+        ..Default::default()
+    };
+
+    let mut rng = XorShift64::new(seed);
+    for seq in 0..keys {
+        let (key, value) = op_kv(&mut rng, seq);
+        db.put_with_options(key.as_bytes(), value.as_bytes(), &put_opts, &write_opts)
+            .await
+            .unwrap_or_else(|e| panic!("usurper put seq={seq}: {e}"));
+        append_ack(&mut log, seq, &key, &value);
+    }
+    println!("USURPER acked={keys}");
+
+    // Hold briefly so the victim (spinning its attempt loop) gets a guaranteed
+    // post-open window to observe the fence, then close cleanly.
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    db.close().await.expect("db.close");
+    println!("USURPER done keys={keys} ack_log={ack_log}");
+}
+
 #[tokio::main]
 async fn main() {
     let argv: Vec<String> = std::env::args().collect();
     if argv.len() < 2 {
-        eprintln!("usage: slatedb-driver <run|verify|durprobe|remote-run|verify-remote> [flags]");
+        eprintln!("usage: slatedb-driver <run|verify|durprobe|remote-run|verify-remote|inflight-probe|fence-victim|fence-usurper> [flags]");
         std::process::exit(2);
     }
     let sub = argv[1].as_str();
@@ -731,6 +908,8 @@ async fn main() {
         "remote-run" => cmd_remote_run(rest).await,
         "verify-remote" => cmd_verify_remote(rest).await,
         "inflight-probe" => cmd_inflight_probe(rest).await,
+        "fence-victim" => cmd_fence_victim(rest).await,
+        "fence-usurper" => cmd_fence_usurper(rest).await,
         "-h" | "--help" => {
             println!(
                 "slatedb-driver <run|verify|durprobe|remote-run|verify-remote|inflight-probe>\n\
@@ -739,7 +918,9 @@ async fn main() {
                  durprobe       --root <dir> --seed <u64> [--keys <n>]\n\
                  remote-run     --root <dir> --remote-log <path> --seed <u64> --ops <n> [--durable-every <n>]\n\
                  verify-remote  --root <dir> --remote-log <path>\n\
-                 inflight-probe --root <dir> --seed <u64> [--keys <n>]"
+                 inflight-probe --root <dir> --seed <u64> [--keys <n>]\n\
+                 fence-victim   --root <dir> --ack-log <path> --seed <u64> [--attempts <n>] [--prelude-keys <n>]\n\
+                 fence-usurper  --root <dir> --ack-log <path> --seed <u64> [--keys <n>]"
             );
         }
         other => {

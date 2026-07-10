@@ -22,7 +22,7 @@ path = "src/main.rs"
 # InMemory need only the base object_store, which is pure Rust.
 slatedb = { path = "../../slatedb", default-features = false }
 object_store = "0.14.0"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 bytes = "1"
 async-trait = "0.1"
 futures = "0.3"
