@@ -56,14 +56,14 @@ explorations:
       "drop one WAL PUT mid-stream" framing was certified guaranteed-green: the
       single sequential flusher (wal_buffer.rs:308-316) never acks and never
       writes id>N on a dropped PUT, so no gap and no lost ack arise.)
-    status: ready
-    result: null
+    status: done
+    result: green
     reason: null
     workload: workloads/durable_ack.py
     command: python3 .workers/workloads/durable_ack.py --case wal-head-contiguity
     faults: [objectstore-head-false-negative, process-kill]
     depth: 20
-    replay: null
+    replay: {run: "nd7f7ygzkt1tbyzgn6w5n47szh8a9tmk", case: wal-head-contiguity, seed: 5}
     freshness: new-current
     reported: null
     published: null
@@ -169,5 +169,35 @@ candidate reuses. Executor tasks:
 
 ## Execution / evidence notes
 
-(executor appends: chosen build path, first green baseline run id, any red +
-replay seed, reality notes on flush timing and ack-vs-persist ordering.)
+**Ladder floor COMPLETE (3/3 rungs, all GREEN) — 2026-07-10.**
+Build: bespoke `slatedb-driver`, musl static-pie, `default-features=false`. Kill
+trigger keyed on ack-progress (the sim runs ~0.56s/ack vs box ~0.1s; wall-clock
+windows VOID).
+
+- **durable-ack-baseline** — GREEN (run 01KX5Y6CBA…). Oracle proven: green +
+  `ORACLE_SELFTEST` red (in `--violations`).
+- **durable-ack-crash-mid-flush** — GREEN (exploration nd7c90v…). SlateDB
+  recovers every acked write from an abrupt mid-flush SIGKILL; durawatch clean.
+- **durable-ack-wal-head-contiguity** — GREEN (exploration nd7f7yg…). The
+  strategy-critic's **silent-truncation hypothesis is REFUTED**, source-verified:
+  a false-negative HEAD on a to-be-replayed WAL SST makes reopen fail **loudly**
+  (`kind: Data` NotFound), never a silent truncation. Two guards:
+  (1) `write_wal_fence` uses `PutMode::Create`, so the fence-barrier walk
+  (`fence.rs:143-172`) increments on every AlreadyExists/Fenced and self-corrects
+  a false-low frontier — it cannot skip a real contiguous WAL object;
+  (2) replay's SST read of the lied-about id fails loudly rather than truncating.
+  The HEAD frontier IS on the durability-critical reopen path (`builder.rs:574-578,
+  590,772`; `fence.rs:165` bounds replay at `empty_wal_id+1` from the frontier;
+  manifest records only `replay_after_wal_id`, so the un-manifested acked tail is
+  genuinely frontier-discovered) — the window is real, the code is robust.
+  A control (truthful-HEAD) reopen reads the full acked set, proving durability.
+
+**Secondary observation (NOT a data-loss finding):** a single false-negative
+HEAD on a to-be-replayed WAL object makes writer-open fail loudly. This needs an
+object store that violates its own contract (404 for a present object);
+`RetryingObjectStore` (#1909) is designed to mask exactly such transient 404s.
+Open follow-up (→ backlog `retrying-store-writer-open`): does RetryingObjectStore
+wrap the default **writer-open / WAL-frontier** path, or only Admin/Clone/reader
+paths? If the writer-open frontier is unwrapped, a transient real-store 404
+during reopen surfaces as an availability failure the retry layer was meant to
+absorb.

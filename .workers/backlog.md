@@ -1,6 +1,6 @@
 # Backlog
-- active: 10
-- areas: { clone: 2, gc: 2, consistency: 3, fencing: 1, compaction: 1, durability: 1 }
+- active: 11
+- areas: { clone: 2, gc: 2, consistency: 3, fencing: 1, compaction: 1, durability: 2 }
 - top-score: 400
 - threshold: 20        # stop/retire line — tune per project, here
 
@@ -18,5 +18,7 @@
 | 240 | wal-fence-gc-destructive — with wal_fence_options dry_run=false, GC must not delete a WAL/SST/fence still referenced; the fence-position race must not resurrect a stale WAL | gc | 3·5·4·4·3/3 | "slatedb/src/garbage_collector/wal_gc.rs:141-146; config.rs:1391-1408 (explicit data-loss warning)" | scout-tests | [path: wal-fence-gc] maintainer-flagged edge (#352) — excellent dossier material |
 | 192 | read-scan-mvcc-ttl — a live scan/iterator must return a snapshot-consistent view across concurrent flush+compaction (no torn/phantom), and TTL-expired keys must expire consistently without resurrecting | consistency | 3·4·4·4·3/3 | "slatedb/src/db_iter.rs; config.rs:490-498 (PutOptions.ttl, expire_ts_from)" | critic | [path: db-iter-ttl] strategy-critic missing-seam: classic wrong-value surface, zero coverage; distinct from snapshot-pin (read correctness, not GC pinning) |
 | 180 | wal-retry-double-apply — a WAL-SST PUT that times out but actually committed, then is re-PUT, must not double-apply on the same wal_id on replay | durability | 3·5·3·4·3/3 | "slatedb/src/wal_replay.rs; tablestore.rs write path; churn 5cdc57d/#1885" | scout-runtime | [path: wal-replay] REFRAMED (critic): the naive drop-one-PUT is guaranteed-green on the single sequential flusher (wal_buffer.rs:308-316); the real seam is retry/idempotency of a committed-but-timed-out PUT; R/O lowered from the original 400 row |
+
+| 108 | retrying-store-writer-open — does RetryingObjectStore (#1909) wrap the default WRITER-OPEN / WAL-frontier path, or only Admin/Clone/reader? A transient real-store 404 during reopen that the retry layer should absorb would otherwise surface as an availability failure | durability | 3·2·3·4·3/2 | "slatedb/src/db/builder.rs:574-578; fence.rs:143-172; commit 016b676/#1909 RetryingObjectStore into Admin+Clone" | verdict-reentry | [path: builder-open] surfaced by executor #3 (wal-head-contiguity): a false-negative HEAD on writer-open fails loudly; #1909 wrapped Admin+Clone — check if writer-open is covered. Availability-weighted, needs a transient-404 (not permanent) fault wrapper |
 
 ## Archive (no loop agent reads this)
