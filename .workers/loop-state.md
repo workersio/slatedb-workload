@@ -1,32 +1,28 @@
 # Loop state
 - rails: { loops: 100, workloads: 250 }   # defaults — safety rails, not targets
-- counters: { episodes: 4, producer: 1, executor: 3, workloads: 3 }
+- counters: { episodes: 5, producer: 1, executor: 4, workloads: 4 }
 - no-new-info: { streak: 0, K: 5 }
 - in-flight unit: none
-- re-entry: durable-ack-wal-head-contiguity → switch — GREEN; durable-ack ladder floor COMPLETE (3/3, silent-truncation hypothesis refuted with source guards). Return to dispatcher; ready buffer (durability-filter-remote, 3 rungs) precedes the backlog. No L decay (3 greens on distinct harnesses, not same-corridor supersets). Added corridor retrying-store-writer-open.
+- re-entry: durability-filter-remote-baseline → deepen — GREEN (non-vacuity control: Remote excludes not-yet-durable data). Next rung crash-confirm (R_remote ⊆ survivors after SIGKILL) is the adversarial bug hunt, already ready. No L change (control green, weak evidence).
 - last-scanned-sha: 016b676ee125f02cb14054cce0cd5a78f3524ac5
 - target-head-sha: 016b676ee125f02cb14054cce0cd5a78f3524ac5
 - re-plan triggers: none
 - publish-pending: []   # all 3 durable-ack officials live (baseline nd7db1rk, crash-mid-flush nd72ajfy, wal-head-contiguity nd7epmpg)
 - last episode summary: |
-    Executor #3 (durable-ack-wal-head-contiguity) — GREEN, the genuine-bug
-    candidate. Silent-truncation hypothesis REFUTED (source-verified): a
-    false-negative HEAD on a to-be-replayed WAL SST → LOUD reopen failure, never
-    silent loss. Guards: PutMode::Create fence-barrier walk self-corrects a
-    false-low frontier (fence.rs:143-172); replay read of the lied-about id fails
-    loudly. Control (truthful) reopen proves the acked tail durable. Driver:
-    verify open returns Result (no panic) + VERIFY_OPEN_FAILED line. Surfaced
-    follow-up corridor retrying-store-writer-open (does #1909 wrap writer-open?).
-    durable-ack promise now fully covered to floor (3/3 green).
+    Executor #4 (durability-filter-remote-baseline) — GREEN (non-vacuity
+    control). Driver gained `durprobe` (flush_interval=None → deterministic dirty
+    window): await_durable=false write visible to Memory, excluded from Remote
+    until db.flush(). reader.rs:112-113 caps Remote at last_remote_persisted_seq;
+    in-tree tests corroborate. remote_dirty_hits=0 is the falsifiable core.
+    Selftest red proven.
 
     RESUME POINTER (fresh session): dispatcher row 5 → executor on
-    **durability-filter-remote-baseline** (status: ready, oldest ready promise).
-    Reuses slatedb-driver — EXTEND it with `read --durability {memory,remote}`
-    and `put --no-await-durable` ops, then the workload checks R_remote ⊆
-    survivors after crash + the Memory/Remote discrimination (non-vacuity
-    control). Then its crash-confirm + inflight-flush rungs, then the backlog
-    (top: clone-consistency 400, compacted-gc-vs-reader 400 — both need
+    **durability-filter-remote-crash-confirm** (status: ready) — the adversarial
+    rung: snapshot the Remote read-set, SIGKILL (reuse crash-mid-flush's
+    ack-progress kill), reopen, assert R_remote ⊆ survivors (a Remote value that
+    then vanishes = wrong-durable-read). Interleave await_durable=false writers so
+    Memory/Remote diverge. Then durability-filter-remote-inflight-flush, then the
+    backlog (top: clone-consistency 400, compacted-gc-vs-reader 400 — both need
     Admin::create_clone / a GC loop wired into the driver = a bigger build).
-    Also pending: re-fire publish.py for the 2 pending officials once convex
-    load eases. Driver rebuild recipe + verdict-reading gotchas in
+    Driver rebuild recipe + verdict-reading gotchas + durprobe in
     runs/executor-notes.md. Nothing in flight; all state committed.

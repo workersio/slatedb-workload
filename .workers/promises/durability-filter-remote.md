@@ -15,14 +15,14 @@ explorations:
       default Memory-filter read but MUST NOT appear in a Remote-filter read
       until it is durable; once flushed it appears to both. Proves the oracle
       discriminates the two levels at all (non-vacuity control).
-    status: ready
-    result: null
+    status: done
+    result: green
     reason: null
     workload: workloads/durability_filter.py
     command: python3 .workers/workloads/durability_filter.py --case baseline
     faults: []
     depth: 10
-    replay: null
+    replay: {run: "nd76yqtq10k1s278byrn0e9q018a971z", case: baseline, seed: 3}
     freshness: new-current
     reported: null
     published: null
