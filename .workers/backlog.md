@@ -1,12 +1,22 @@
 # Backlog
-- active: 0
-- areas: {}
-- top-score: 0
+- active: 10
+- areas: { clone: 2, gc: 2, consistency: 3, fencing: 1, compaction: 1, durability: 1 }
+- top-score: 400
 - threshold: 20        # stop/retire line — tune per project, here
 
 ## Active (sorted by score, descending)
 
 | score | candidate | area | L·I·O·N·R/C | provenance | source | notes |
 |-------|-----------|------|-------------|------------|--------|-------|
+| 400 | clone-consistency — a zero-copy clone must equal the parent's committed snapshot at clone time and stay readable while the parent writes/compacts/GCs its shared external SSTs (bidirectional isolation + bounded external_dbs) | clone | 4·5·4·5·3/3 | "slatedb/src/clone.rs:177; checkpoint.rs; commits 6a131a9/#1907, 1b3093f/#1851, ba98f68/#1811" | scout-commits | [path: clone-external-sst] freshest correctness churn, ZERO workload coverage (no DST clone actor); needs Admin::create_clone wired as a driver op |
+| 400 | compacted-gc-vs-reader — with compacted GC enabled a scan outliving its checkpoint reads a GC-deleted SST → FileNotFound (data-loss) | gc | 4·5·5·4·3/3 | "slatedb-dst/tests/bank.rs:193-199 (#319 disabled); slatedb/src/garbage_collector/compacted_gc.rs:599" | scout-tests | [path: gc-vs-reader] critic-confirmed: authors DISABLE this in their flagship test; reuses bank conservation oracle + a real GC loop; needs checkpoint/scan actor |
+| 341 | writer-fencing-split-brain — after a 2nd Db handle opens, the 1st handle's next await_durable write must fail Fenced and leave no durably-visible violating write | fencing | 4·4·4·4·4/3 | "slatedb/src/fence.rs:105-160; manifest/store.rs:34,621; manifest/invariants.rs:42" | scout-docs | [path: fence-epoch-cas] two driver processes on shared FS; DST fences only in-process |
+| 288 | reader-checkpoint-reestablish — a self-established reader checkpoint reaped by writer GC during an object-store brownout must re-establish, not fail permanently | consistency | 4·3·4·3·4/2 | "slatedb/src/db_reader.rs; commit 960d933/#1900; bank.rs:76-85 skips WAL toxics to avoid this" | scout-commits | [path: reader-checkpoint] availability-weighted; exercise the config bank.rs deliberately avoids |
+| 267 | ssi-write-skew — under SerializableSnapshot no concurrent schedule may produce a write-skew (serializability violation SI permits) | consistency | 4·4·5·5·2/3 | "slatedb/src/transaction_manager.rs:16-21,282-322,346-367" | scout-api | [path: txn-ssi] bank uses SI only; SSI + committed-state conflict-GC uncovered; SI run is the non-vacuity control |
+| 256 | compactor-ownership-race — two competing/restarting compactors must not commit a manifest dropping SSTs; compaction preserves every live key | compaction | 4·4·4·3·4/3 | "slatedb/src/compactor.rs; commits da14c59/#1856, 297b6a1/#1884" | scout-commits | [path: compaction] DST spawns one compactor; reuses crash driver + admin run-compactor |
+| 256 | snapshot-checkpoint-pin-vs-gc — a snapshot/checkpoint reflects state at seq S forever and GC never deletes objects it pins, across concurrent compaction + restart | clone | 4·4·4·4·3/3 | "slatedb/src/db.rs:768-802; snapshot_manager.rs; rfcs/0004:76-78" | scout-docs | [path: snapshot-manager] scope to default features (rfcs/0017 compaction-filters disclaims snapshot consistency) |
+| 240 | wal-fence-gc-destructive — with wal_fence_options dry_run=false, GC must not delete a WAL/SST/fence still referenced; the fence-position race must not resurrect a stale WAL | gc | 3·5·4·4·3/3 | "slatedb/src/garbage_collector/wal_gc.rs:141-146; config.rs:1391-1408 (explicit data-loss warning)" | scout-tests | [path: wal-fence-gc] maintainer-flagged edge (#352) — excellent dossier material |
+| 192 | read-scan-mvcc-ttl — a live scan/iterator must return a snapshot-consistent view across concurrent flush+compaction (no torn/phantom), and TTL-expired keys must expire consistently without resurrecting | consistency | 3·4·4·4·3/3 | "slatedb/src/db_iter.rs; config.rs:490-498 (PutOptions.ttl, expire_ts_from)" | critic | [path: db-iter-ttl] strategy-critic missing-seam: classic wrong-value surface, zero coverage; distinct from snapshot-pin (read correctness, not GC pinning) |
+| 180 | wal-retry-double-apply — a WAL-SST PUT that times out but actually committed, then is re-PUT, must not double-apply on the same wal_id on replay | durability | 3·5·3·4·3/3 | "slatedb/src/wal_replay.rs; tablestore.rs write path; churn 5cdc57d/#1885" | scout-runtime | [path: wal-replay] REFRAMED (critic): the naive drop-one-PUT is guaranteed-green on the single sequential flusher (wal_buffer.rs:308-316); the real seam is retry/idempotency of a committed-but-timed-out PUT; R/O lowered from the original 400 row |
 
 ## Archive (no loop agent reads this)

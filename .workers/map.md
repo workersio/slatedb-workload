@@ -78,7 +78,68 @@ before relying):
 
 | Key | Title | Spec |
 |-----|-------|------|
-| _(none yet — first producer episode fills from product claims)_ | | |
+| durability | Durability | areas/durability.md |
+| consistency | Consistency & Isolation | areas/consistency.md |
+| fencing | Writer Fencing | areas/fencing.md |
+| clone | Clones & Checkpoints | areas/clone.md |
+| gc | Garbage Collection | areas/gc.md |
+| compaction | Compaction | areas/compaction.md |
+
+## Mapping-breadth floor (module reconciliation, producer #1 fan-out 2026-07-10)
+
+Every source module is inside an area's loci or explicitly parked.
+- `slatedb/src/{wal_buffer,batch_write,wal_replay,db,tablestore}.rs` → durability
+- `slatedb/src/{config,transaction_manager,db_transaction,db_reader,db_iter,reader}.rs`,
+  `slatedb-txn-obj/` → consistency
+- `slatedb/src/{fence,manifest/}.rs` → fencing
+- `slatedb/src/{clone,checkpoint,snapshot_manager}.rs` → clone
+- `slatedb/src/garbage_collector/**` → gc
+- `slatedb/src/{compactor,compactor_executor,compactor_state,compaction_worker}.rs` → compaction
+- `slatedb-cli/` → **not parked**: a control-plane driving surface (checkpoint/GC/
+  run-compactor) usable by fencing/gc/compaction workloads (admin ops as a 2nd process).
+- `slatedb-bencher/` → **parked: reference-only** — op-generation patterns to reuse, not a SUT.
+- `slatedb-dst/` → **parked: reference-only** — upstream in-process determ-sim; our axis is
+  whole-process OS-level faults. Mine its op/fault/oracle model, do not wrap it.
+- `bindings/uniffi/` → **parked: separate-surface** (FFI; out of the durability/consistency scope).
+- `examples/` → **parked: docs/skeleton** — the driver-open reference (db_without_compactor.rs, s3_compatible.rs).
+- `schemas/`, `specs/`, `rfcs/`, `website/` → **parked: docs-only** (provenance sources).
+
+## Census (budget allocation basis)
+
+No `.workers/census.md` yet (fresh target, zero confirmed-bug history of our own).
+Per producer.md §Budget allocation rule 1, with no red-rate history the split IS
+the census mix; with no census either, the first batch is baseline-heavy by the
+ladder floor. Git-history exposure (scout-commits) points budget at WAL/durability,
+compaction, and clone churn first. Build `census.md` once the first sweeps produce
+red-rate data (after the driver lands and a few explorations run).
+
+## SUT driver — decision (producer #1, strategy-critic-verified): vendored musl static, default-features=false
+
+Primary path: build the bespoke `slatedb-driver` bin here as
+`x86_64-unknown-linux-musl` static, vendor to `.workers/vendor/bin/slatedb-driver`,
+`build.sh` verifies+chmods (S2-proven, offline, toolchain-free in-image).
+
+**Critical (strategy-critic, source-verified):** depend on slatedb with
+`default-features = false`. `slatedb/Cargo.toml` default = `["aws","foyer"]`;
+`aws` pulls object_store/aws → reqwest/hyper → rustls(ring)/openssl and `foyer`
+pulls a C/io_uring hybrid cache — exactly the deps that fight musl static. The
+crash/durability/consistency workloads only need `LocalFileSystem` + `InMemory`
+(base `object_store`, pure-Rust: tokio, bytes, crc32fast) which links musl-static
+cleanly. So build `slatedb = { path = "…", default-features = false }`.
+Build-in-image (cargo in a rust base image) is the fallback ONLY if a transitive
+pure-Rust dep still balks — feature-gating, not the base image, is the first move.
+
+**Ack-log crash-safety (mandatory — else false GREENs):** the durability oracle
+is `A ⊆ R` where `A` = the driver's recorded acked set. If the ack-log is not
+fsync'd per ack, a SIGKILL in the window "DB durable, ack-log not yet fsync'd"
+drops K from `A` and `A ⊆ R` holds falsely, masking real data-loss. Rules: (1)
+write+fsync the ack-log entry the instant each `put` future resolves, before the
+next op; (2) ack-log lives OUTSIDE the DB root so the object-store fault wrapper
+cannot corrupt it; (3) driver does NO graceful cleanup on crash (SIGKILL-safe);
+(4) `verify` reopens with the identical store + feature config.
+
+Full driver contract in `promises/durable-ack-survives-crash.md` §Workload plan.
+The executor records the realized build outcome (musl vs in-image) here.
 
 ## Promoted findings
 
